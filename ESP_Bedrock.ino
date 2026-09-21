@@ -1574,7 +1574,7 @@ private:
 
     int rc = mbedtls_ecdh_get_params(
       &ecdh,
-      mbedtls_pk_ec(&serverKey),
+      mbedtls_pk_ec(serverKey),
       MBEDTLS_ECDH_OURS
     );
     if (rc != 0) {
@@ -1586,7 +1586,7 @@ private:
 
     rc = mbedtls_ecdh_get_params(
       &ecdh,
-      mbedtls_pk_ec(&clientKey),
+      mbedtls_pk_ec(clientKey),
       MBEDTLS_ECDH_THEIRS
     );
     if (rc != 0) {
