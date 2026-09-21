@@ -16,12 +16,29 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@v4
 
+
+      - name: Create release staging directory
+        run: mkdir -p release
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 Arduino core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Compile official ESP32-WROVER firmware
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          arduino-cli compile             --fqbn esp32:esp32:esp32wrover             --output-dir build             .
+          cp build/*.bin release/
+
       - name: Prepare release assets
         shell: bash
         run: |
           set -euo pipefail
-
-          mkdir -p release
 
           # The Arduino sketch is always included in stable releases.
           cp ESP_Bedrock.ino "release/ESP_Bedrock-\${GITHUB_REF_NAME}.ino"
