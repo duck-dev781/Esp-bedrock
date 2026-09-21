@@ -862,6 +862,13 @@ private:
     out[3] = (uint8_t)(value >> 24);
   }
 
+  static void writeU32BE(uint8_t *out, uint32_t value) {
+    out[0] = (uint8_t)(value >> 24);
+    out[1] = (uint8_t)(value >> 16);
+    out[2] = (uint8_t)(value >> 8);
+    out[3] = (uint8_t)value;
+  }
+
   static uint32_t readU32LE(const uint8_t *in) {
     return ((uint32_t)in[0]) |
            ((uint32_t)in[1] << 8) |
@@ -1452,6 +1459,564 @@ private:
     networkSettingsRequestsCount++;
   }
 
+
+  bool ensureCrypto() {
+    if (cryptoInitialized) return true;
+
+    mbedtls_pk_init(&serverKey);
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&drbg);
+
+    const uint8_t personalization[] = "ESP-Bedrock";
+    const int seedRc = mbedtls_ctr_drbg_seed(
+      &drbg,
+      mbedtls_entropy_func,
+      &entropy,
+      personalization,
+      sizeof(personalization) - 1
+    );
+    if (seedRc != 0) {
+      Serial.printf("[CRYPTO] CTR-DRBG init failed: %d\n", seedRc);
+      return false;
+    }
+
+    const int setupRc = mbedtls_pk_setup(
+      &serverKey,
+      mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)
+    );
+    if (setupRc != 0) {
+      Serial.printf("[CRYPTO] EC key setup failed: %d\n", setupRc);
+      return false;
+    }
+
+    const int keyRc = mbedtls_ecp_gen_key(
+      MBEDTLS_ECP_DP_SECP384R1,
+      mbedtls_pk_ec(serverKey),
+      mbedtls_ctr_drbg_random,
+      &drbg
+    );
+    if (keyRc != 0) {
+      Serial.printf("[CRYPTO] P-384 key generation failed: %d\n", keyRc);
+      return false;
+    }
+
+    const int derRc = mbedtls_pk_write_pubkey_der(
+      &serverKey,
+      serverPubKeyDer,
+      sizeof(serverPubKeyDer)
+    );
+    if (derRc <= 0) {
+      Serial.printf("[CRYPTO] Public-key DER export failed: %d\n", derRc);
+      return false;
+    }
+
+    serverPubKeyDerLength = (size_t)derRc;
+    memmove(
+      serverPubKeyDer,
+      serverPubKeyDer + sizeof(serverPubKeyDer) - serverPubKeyDerLength,
+      serverPubKeyDerLength
+    );
+
+    serverPubKeyBase64 = base64Encode(
+      serverPubKeyDer,
+      serverPubKeyDerLength,
+      false
+    );
+
+    cryptoInitialized = true;
+    Serial.println("[CRYPTO] P-384 server key ready.");
+    return true;
+  }
+
+  bool derivePeerKey(Peer &peer,
+                     const uint8_t *clientDer,
+                     size_t clientDerLength) {
+    if (!cryptoInitialized) return false;
+
+    mbedtls_pk_context clientKey;
+    mbedtls_pk_init(&clientKey);
+
+    const int parseRc = mbedtls_pk_parse_public_key(
+      &clientKey,
+      clientDer,
+      clientDerLength
+    );
+
+    if (parseRc != 0 ||
+        !mbedtls_pk_can_do(&clientKey, MBEDTLS_PK_ECKEY)) {
+      Serial.printf("[CRYPTO] Client public-key parse failed: %d\n", parseRc);
+      mbedtls_pk_free(&clientKey);
+      return false;
+    }
+
+    mbedtls_ecp_keypair *serverEc = mbedtls_pk_ec(serverKey);
+    mbedtls_ecp_keypair *clientEc = mbedtls_pk_ec(clientKey);
+
+    if (serverEc->grp.id != MBEDTLS_ECP_DP_SECP384R1 ||
+        clientEc->grp.id != MBEDTLS_ECP_DP_SECP384R1 ||
+        mbedtls_ecp_check_pubkey(&serverEc->grp, &clientEc->Q) != 0) {
+      Serial.println("[CRYPTO] Client key is not a valid P-384 public key.");
+      mbedtls_pk_free(&clientKey);
+      return false;
+    }
+
+    mbedtls_mpi shared;
+    mbedtls_mpi_init(&shared);
+
+    const int sharedRc = mbedtls_ecp_compute_shared(
+      &serverEc->grp,
+      &shared,
+      &clientEc->Q,
+      &serverEc->d,
+      mbedtls_ctr_drbg_random,
+      &drbg
+    );
+
+    if (sharedRc != 0) {
+      Serial.printf("[CRYPTO] ECDH failed: %d\n", sharedRc);
+      mbedtls_mpi_free(&shared);
+      mbedtls_pk_free(&clientKey);
+      return false;
+    }
+
+    uint8_t sharedSecret[48] = {};
+    const int secretRc = mbedtls_mpi_write_binary(
+      &shared,
+      sharedSecret,
+      sizeof(sharedSecret)
+    );
+    mbedtls_mpi_free(&shared);
+
+    if (secretRc != 0) {
+      Serial.printf("[CRYPTO] Shared-secret export failed: %d\n", secretRc);
+      mbedtls_pk_free(&clientKey);
+      return false;
+    }
+
+    uint8_t keyInput[64] = {};
+    memcpy(keyInput, peer.encryptionSalt, 16);
+    memcpy(keyInput + 16, sharedSecret, sizeof(sharedSecret));
+
+    const int hashRc = mbedtls_sha256_ret(
+      keyInput,
+      sizeof(keyInput),
+      peer.sessionKey,
+      0
+    );
+
+    memset(sharedSecret, 0, sizeof(sharedSecret));
+    memset(keyInput, 0, sizeof(keyInput));
+    mbedtls_pk_free(&clientKey);
+
+    if (hashRc != 0) {
+      Serial.printf("[CRYPTO] Session-key SHA-256 failed: %d\n", hashRc);
+      return false;
+    }
+
+    mbedtls_aes_init(&peer.aesSend);
+    mbedtls_aes_init(&peer.aesReceive);
+
+    if (mbedtls_aes_setkey_enc(&peer.aesSend, peer.sessionKey, 256) != 0 ||
+        mbedtls_aes_setkey_enc(&peer.aesReceive, peer.sessionKey, 256) != 0) {
+      mbedtls_aes_free(&peer.aesSend);
+      mbedtls_aes_free(&peer.aesReceive);
+      Serial.println("[CRYPTO] AES-256 setup failed.");
+      return false;
+    }
+
+    memset(peer.aesSendNonce, 0, sizeof(peer.aesSendNonce));
+    memset(peer.aesReceiveNonce, 0, sizeof(peer.aesReceiveNonce));
+    memcpy(peer.aesSendNonce, peer.sessionKey, 12);
+    memcpy(peer.aesReceiveNonce, peer.sessionKey, 12);
+    peer.aesSendNonce[15] = 2;
+    peer.aesReceiveNonce[15] = 2;
+
+    peer.aesSendOffset = 0;
+    peer.aesReceiveOffset = 0;
+    peer.sendPacketCounter = 0;
+    peer.receivePacketCounter = 0;
+    memset(peer.aesSendStream, 0, sizeof(peer.aesSendStream));
+    memset(peer.aesReceiveStream, 0, sizeof(peer.aesReceiveStream));
+    peer.aesInitialized = true;
+    peer.encryptionReady = true;
+
+    return true;
+  }
+
+  bool signHandshakeInput(const String &signingInput,
+                          uint8_t rawSignature[96]) {
+    uint8_t hash[64] = {};
+    if (mbedtls_sha512_ret(
+          (const unsigned char *)signingInput.c_str(),
+          signingInput.length(),
+          hash,
+          0) != 0) {
+      return false;
+    }
+
+    mbedtls_ecp_keypair *serverEc = mbedtls_pk_ec(serverKey);
+    mbedtls_mpi r;
+    mbedtls_mpi s;
+    mbedtls_mpi_init(&r);
+    mbedtls_mpi_init(&s);
+
+    const int signRc = mbedtls_ecdsa_sign(
+      &serverEc->grp,
+      &r,
+      &s,
+      &serverEc->d,
+      hash,
+      48,
+      mbedtls_ctr_drbg_random,
+      &drbg
+    );
+
+    if (signRc != 0) {
+      mbedtls_mpi_free(&r);
+      mbedtls_mpi_free(&s);
+      return false;
+    }
+
+    const int rRc = mbedtls_mpi_write_binary(&r, rawSignature, 48);
+    const int sRc = mbedtls_mpi_write_binary(&s, rawSignature + 48, 48);
+    mbedtls_mpi_free(&r);
+    mbedtls_mpi_free(&s);
+
+    return rRc == 0 && sRc == 0;
+  }
+
+  bool createHandshakeJwt(const uint8_t *token,
+                          size_t tokenLength,
+                          String &jwt) {
+    if (!ensureCrypto()) return false;
+
+    const String headerJson =
+      String("{\"alg\":\"ES384\",\"x5u\":\"") +
+      serverPubKeyBase64 +
+      "\"}";
+
+    const String payloadJson =
+      String("{\"salt\":\"") +
+      base64Encode(token, tokenLength, false) +
+      "\"}";
+
+    const String headerB64 =
+      base64Encode(
+        (const uint8_t *)headerJson.c_str(),
+        headerJson.length(),
+        true
+      );
+
+    const String payloadB64 =
+      base64Encode(
+        (const uint8_t *)payloadJson.c_str(),
+        payloadJson.length(),
+        true
+      );
+
+    const String signingInput = headerB64 + "." + payloadB64;
+    uint8_t rawSignature[96] = {};
+
+    if (!signHandshakeInput(signingInput, rawSignature)) return false;
+
+    jwt = signingInput + "." +
+          base64Encode(rawSignature, sizeof(rawSignature), true);
+    return true;
+  }
+
+  bool encryptBytes(Peer &peer, uint8_t *data, size_t length) {
+    if (!peer.encryptionReady || !peer.aesInitialized) return false;
+
+    size_t ncOffset = peer.aesSendOffset;
+    const int rc = mbedtls_aes_crypt_ctr(
+      &peer.aesSend,
+      length,
+      &ncOffset,
+      peer.aesSendNonce,
+      peer.aesSendStream,
+      data,
+      data
+    );
+    if (rc != 0) return false;
+
+    peer.aesSendOffset = ncOffset;
+    return true;
+  }
+
+  bool decryptBytes(Peer &peer, uint8_t *data, size_t length) {
+    if (!peer.encryptionReady || !peer.aesInitialized) return false;
+
+    size_t ncOffset = peer.aesReceiveOffset;
+    const int rc = mbedtls_aes_crypt_ctr(
+      &peer.aesReceive,
+      length,
+      &ncOffset,
+      peer.aesReceiveNonce,
+      peer.aesReceiveStream,
+      data,
+      data
+    );
+    if (rc != 0) return false;
+
+    peer.aesReceiveOffset = ncOffset;
+    return true;
+  }
+
+  bool addEncryptionTrailer(Peer &peer,
+                            const uint8_t *plaintext,
+                            size_t plaintextLength,
+                            uint8_t trailer[8]) {
+    const size_t inputLength =
+      8 + plaintextLength + sizeof(peer.sessionKey);
+
+    uint8_t *input = (uint8_t *)malloc(inputLength);
+    if (!input) return false;
+
+    for (uint8_t i = 0; i < 8; ++i) {
+      input[i] = (uint8_t)(peer.sendPacketCounter >> (8U * i));
+    }
+
+    memcpy(input + 8, plaintext, plaintextLength);
+    memcpy(
+      input + 8 + plaintextLength,
+      peer.sessionKey,
+      sizeof(peer.sessionKey)
+    );
+
+    uint8_t digest[32] = {};
+    const int rc = mbedtls_sha256_ret(
+      input,
+      inputLength,
+      digest,
+      0
+    );
+    free(input);
+
+    if (rc != 0) return false;
+
+    memcpy(trailer, digest, 8);
+    peer.sendPacketCounter++;
+    return true;
+  }
+
+  bool validateEncryptionTrailer(Peer &peer,
+                                 const uint8_t *plaintext,
+                                 size_t plaintextLength,
+                                 const uint8_t trailer[8]) {
+    const size_t inputLength =
+      8 + plaintextLength + sizeof(peer.sessionKey);
+
+    uint8_t *input = (uint8_t *)malloc(inputLength);
+    if (!input) return false;
+
+    for (uint8_t i = 0; i < 8; ++i) {
+      input[i] = (uint8_t)(peer.receivePacketCounter >> (8U * i));
+    }
+
+    memcpy(input + 8, plaintext, plaintextLength);
+    memcpy(
+      input + 8 + plaintextLength,
+      peer.sessionKey,
+      sizeof(peer.sessionKey)
+    );
+
+    uint8_t digest[32] = {};
+    const int rc = mbedtls_sha256_ret(
+      input,
+      inputLength,
+      digest,
+      0
+    );
+    free(input);
+
+    if (rc != 0) return false;
+
+    if (memcmp(digest, trailer, 8) != 0) return false;
+
+    peer.receivePacketCounter++;
+    return true;
+  }
+
+  bool sendEncryptedBedrockPacket(Peer &peer,
+                                  const uint8_t *packet,
+                                  size_t packetLength) {
+    if (!peer.encryptionReady || packetLength == 0) return false;
+
+    uint8_t batch[2048] = {};
+    size_t offset = 0;
+    batch[offset++] = BEDROCK_BATCH_NONE;
+
+    uint8_t lengthBytes[5] = {};
+    const size_t lengthBytesCount =
+      BedrockProtocol::writeVarUInt(
+        (uint32_t)packetLength,
+        lengthBytes,
+        sizeof(lengthBytes)
+      );
+
+    if (lengthBytesCount == 0 ||
+        offset + lengthBytesCount + packetLength + 8 > sizeof(batch)) {
+      return false;
+    }
+
+    memcpy(batch + offset, lengthBytes, lengthBytesCount);
+    offset += lengthBytesCount;
+    memcpy(batch + offset, packet, packetLength);
+    offset += packetLength;
+
+    uint8_t trailer[8] = {};
+    if (!addEncryptionTrailer(
+          peer, batch, offset, trailer)) return false;
+
+    memcpy(batch + offset, trailer, sizeof(trailer));
+    offset += sizeof(trailer);
+
+    if (!encryptBytes(peer, batch, offset)) return false;
+
+    uint8_t framed[2060] = {};
+    framed[0] = BEDROCK_GAME_PACKET_ID;
+    memcpy(framed + 1, batch, offset);
+
+    sendReliableOrdered(peer, framed, offset + 1);
+    encryptedPacketsSentCount++;
+    return true;
+  }
+
+  bool sendRawBedrockPacket(Peer &peer,
+                            const uint8_t *packet,
+                            size_t packetLength) {
+    if (packetLength == 0 || packetLength > 1800) return false;
+
+    uint8_t framed[1900] = {};
+    size_t offset = 0;
+    framed[offset++] = BEDROCK_GAME_PACKET_ID;
+    framed[offset++] = BEDROCK_BATCH_NONE;
+
+    uint8_t lengthBytes[5] = {};
+    const size_t lengthBytesCount =
+      BedrockProtocol::writeVarUInt(
+        (uint32_t)packetLength,
+        lengthBytes,
+        sizeof(lengthBytes)
+      );
+    if (lengthBytesCount == 0 ||
+        offset + lengthBytesCount + packetLength > sizeof(framed)) {
+      return false;
+    }
+
+    memcpy(framed + offset, lengthBytes, lengthBytesCount);
+    offset += lengthBytesCount;
+    memcpy(framed + offset, packet, packetLength);
+    offset += packetLength;
+
+    sendReliableOrdered(peer, framed, offset);
+    return true;
+  }
+
+  bool sendPlayStatus(Peer &peer, uint32_t status) {
+    uint8_t packet[8] = {};
+    size_t offset = 0;
+
+    const size_t packetIdLength =
+      BedrockProtocol::writeVarUInt(
+        BEDROCK_PLAY_STATUS_ID,
+        packet + offset,
+        sizeof(packet) - offset
+      );
+    if (packetIdLength == 0) return false;
+    offset += packetIdLength;
+
+    if (offset + 4 > sizeof(packet)) return false;
+    writeU32BE(packet + offset, status);
+    offset += 4;
+
+    return sendEncryptedBedrockPacket(peer, packet, offset);
+  }
+
+  bool sendResourcePacksInfo(Peer &peer) {
+    uint8_t packet[64] = {};
+    size_t offset = 0;
+
+    const size_t idLength =
+      BedrockProtocol::writeVarUInt(
+        BEDROCK_RESOURCE_PACKS_INFO_ID,
+        packet + offset,
+        sizeof(packet) - offset
+      );
+    if (idLength == 0) return false;
+    offset += idLength;
+
+    packet[offset++] = 0; // forcedToAccept
+    packet[offset++] = 0; // hasAddonPacks
+    packet[offset++] = 0; // scriptingEnabled
+    packet[offset++] = 0; // vibrantVisualsForceDisabled
+
+    memset(packet + offset, 0, 16);
+    offset += 16;
+
+    size_t written = 0;
+    if (!BedrockProtocol::writeString(
+          "",
+          packet + offset,
+          sizeof(packet) - offset,
+          written)) return false;
+    offset += written;
+
+    uint8_t countBytes[5] = {};
+    const size_t countLength =
+      BedrockProtocol::writeVarUInt(0, countBytes, sizeof(countBytes));
+    if (countLength == 0 || offset + countLength > sizeof(packet)) return false;
+    memcpy(packet + offset, countBytes, countLength);
+    offset += countLength;
+
+    if (!sendEncryptedBedrockPacket(peer, packet, offset)) return false;
+
+    peer.resourcePacksInfoSent = true;
+    return true;
+  }
+
+  bool sendResourcePackStack(Peer &peer) {
+    uint8_t packet[128] = {};
+    size_t offset = 0;
+
+    const size_t idLength =
+      BedrockProtocol::writeVarUInt(
+        BEDROCK_RESOURCE_PACK_STACK_ID,
+        packet + offset,
+        sizeof(packet) - offset
+      );
+    if (idLength == 0) return false;
+    offset += idLength;
+
+    packet[offset++] = 0; // forcedToAccept
+
+    uint8_t countBytes[5] = {};
+    const size_t countLength =
+      BedrockProtocol::writeVarUInt(0, countBytes, sizeof(countBytes));
+    if (countLength == 0 || offset + countLength > sizeof(packet)) return false;
+    memcpy(packet + offset, countBytes, countLength);
+    offset += countLength;
+
+    size_t written = 0;
+    if (!BedrockProtocol::writeString(
+          BEDROCK_VERSION_NAME,
+          packet + offset,
+          sizeof(packet) - offset,
+          written)) return false;
+    offset += written;
+
+    // Empty experiments: int32 LE count, then experimentsPreviouslyToggled and hasEditorPacks.
+    writeU32LE(packet + offset, 0);
+    offset += 4;
+    packet[offset++] = 0;
+    packet[offset++] = 0;
+
+    if (!sendEncryptedBedrockPacket(peer, packet, offset)) return false;
+
+    peer.resourcePackStackSent = true;
+    return true;
+  }
+
   bool sendStartGame(Peer &peer) {
     if (!world || peer.startGameSent) return false;
 
@@ -1807,11 +2372,15 @@ private:
       return;
     }
 
-    if ((response == "resourcepackstackfinished" || response == "completed") &&
-        peer.resourcePackStackSent && !peer.startGameSent) {
-      if (sendStartGame(peer)) {
-        sendPlayStatus(peer, 3);
-        peer.playerSpawnSent = true;
+    if (response == "resourcepackstackfinished" || response == "completed") {
+      if (!peer.resourcePackStackSent) {
+        sendResourcePackStack(peer);
+      }
+      if (peer.resourcePackStackSent && !peer.startGameSent) {
+        if (sendStartGame(peer)) {
+          sendPlayStatus(peer, 3);
+          peer.playerSpawnSent = true;
+        }
       }
     }
   }
@@ -1825,7 +2394,7 @@ private:
 
     uint32_t requestCount = 0;
     if (!BedrockProtocol::readVarUInt(data, length, offset, requestCount)) return;
-    if (requestCount > 256) return;
+    if (requestCount > 96) return;
     if (offset + (size_t)requestCount * 3 + 12 > length) return;
 
     const size_t offsetsStart = offset;
@@ -1852,7 +2421,7 @@ private:
     writeU32LE(packet + out, (uint32_t)centerZ); out += 4;
 
     uint8_t countBytes[5];
-    const countLength =
+    const size_t countLength =
       BedrockProtocol::writeVarUInt(requestCount, countBytes, sizeof(countBytes));
     if (countLength == 0 || out + countLength > sizeof(packet)) return;
     memcpy(packet + out, countBytes, countLength);
@@ -1879,21 +2448,60 @@ private:
   void handleGameBatch(Peer &peer,
                        const uint8_t *data,
                        size_t length) {
-    if (!peer.encryptionReady || length < 10 || data[0] != BEDROCK_GAME_PACKET_ID) return;
+    if (length < 2 || data[0] != BEDROCK_GAME_PACKET_ID) return;
+
+    // ServerToClientHandshake and Login are sent in plaintext. Before
+    // encryption, Bedrock uses FE + either:
+    //   VarUInt(length) + packet (pre-NetworkSettings), or
+    //   FF + VarUInt(length) + packet (after NetworkSettings).
+    if (!peer.encryptionReady) {
+      size_t offset = 1;
+      const bool hasBatchMarker =
+        (data[offset] == BEDROCK_BATCH_NONE);
+
+      if (hasBatchMarker) ++offset;
+
+      while (offset < length) {
+        uint32_t packetLength = 0;
+        if (!BedrockProtocol::readVarUInt(
+              data, length, offset, packetLength)) return;
+
+        if (packetLength == 0 ||
+            packetLength > 64 * 1024 ||
+            offset + packetLength > length) {
+          return;
+        }
+
+        handleBedrockPayload(
+          peer,
+          data + offset,
+          packetLength
+        );
+        offset += packetLength;
+      }
+      return;
+    }
+
+    if (length < 10) return;
 
     const size_t encryptedLength = length - 1;
     uint8_t *plaintext = (uint8_t *)malloc(encryptedLength);
     if (!plaintext) return;
 
     memcpy(plaintext, data + 1, encryptedLength);
-    if (!decryptBytes(peer, plaintext, encryptedLength) || encryptedLength < 9) {
+
+    if (!decryptBytes(peer, plaintext, encryptedLength) ||
+        encryptedLength < 9) {
       free(plaintext);
       return;
     }
 
     const size_t bodyLength = encryptedLength - 8;
     if (!validateEncryptionTrailer(
-          peer, plaintext, bodyLength, plaintext + bodyLength)) {
+          peer,
+          plaintext,
+          bodyLength,
+          plaintext + bodyLength)) {
       free(plaintext);
       return;
     }
@@ -1907,10 +2515,24 @@ private:
     while (offset < bodyLength) {
       uint32_t packetLength = 0;
       if (!BedrockProtocol::readVarUInt(
-            plaintext, bodyLength, offset, packetLength)) break;
-      if (packetLength == 0 || packetLength > 64 * 1024 ||
-          offset + packetLength > bodyLength) break;
-      handleBedrockPayload(peer, plaintext + offset, packetLength);
+            plaintext,
+            bodyLength,
+            offset,
+            packetLength)) {
+        break;
+      }
+
+      if (packetLength == 0 ||
+          packetLength > 64 * 1024 ||
+          offset + packetLength > bodyLength) {
+        break;
+      }
+
+      handleBedrockPayload(
+        peer,
+        plaintext + offset,
+        packetLength
+      );
       offset += packetLength;
     }
 
@@ -2400,17 +3022,13 @@ private:
                   (unsigned long)network->pingsAnswered());
     Serial.printf("  Handshake steps: %lu\n",
                   (unsigned long)network->handshakeSteps());
-    Serial.printf("  Encrypted packets sent: %lu
-",
+    Serial.printf("  Encrypted packets sent: %lu\n",
                   (unsigned long)network->encryptedPacketsSent());
-    Serial.printf("  Encrypted packets received: %lu
-",
+    Serial.printf("  Encrypted packets received: %lu\n",
                   (unsigned long)network->encryptedPacketsReceived());
-    Serial.printf("  Resource-pack responses: %lu
-",
+    Serial.printf("  Resource-pack responses: %lu\n",
                   (unsigned long)network->resourcePackResponses());
-    Serial.printf("  StartGame packets sent: %lu
-",
+    Serial.printf("  StartGame packets sent: %lu\n",
                   (unsigned long)network->startGamePacketsSent());
   }
 
