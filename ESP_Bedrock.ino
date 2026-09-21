@@ -88,6 +88,11 @@
 #define BEDROCK_GAME_PACKET_ID 0xFE
 #define BEDROCK_BATCH_NONE 0xFF
 #define BEDROCK_PLAY_STATUS_ID 2
+#define BEDROCK_SET_TIME_ID 10
+#define BEDROCK_SET_DIFFICULTY_ID 60
+#define BEDROCK_REQUEST_CHUNK_RADIUS_ID 69
+#define BEDROCK_CHUNK_RADIUS_UPDATED_ID 70
+#define BEDROCK_NETWORK_CHUNK_PUBLISHER_UPDATE_ID 121
 #define BEDROCK_SERVER_TO_CLIENT_HANDSHAKE_ID 3
 #define BEDROCK_CLIENT_TO_SERVER_HANDSHAKE_ID 4
 #define BEDROCK_RESOURCE_PACKS_INFO_ID 6
@@ -2259,6 +2264,11 @@ private:
       return;
     }
 
+    if (packetId == BEDROCK_REQUEST_CHUNK_RADIUS_ID) {
+      handleRequestChunkRadius(peer, data + offset, length - offset);
+      return;
+    }
+
     if (packetId == 175) {
       handleSubChunkRequest(peer, data + offset, length - offset);
       return;
@@ -2455,11 +2465,82 @@ private:
       }
       if (peer.resourcePackStackSent && !peer.startGameSent) {
         if (sendStartGame(peer)) {
+          sendWorldBootstrap(peer, 4);
           sendPlayStatus(peer, 3);
           peer.playerSpawnSent = true;
         }
       }
     }
+  }
+
+  bool sendSimpleVarIntPacket(Peer &peer,
+                              uint32_t packetId,
+                              int32_t value) {
+    uint8_t packet[16] = {};
+    size_t offset = 0;
+
+    const size_t idLen = BedrockProtocol::writeVarUInt(
+      packetId, packet + offset, sizeof(packet) - offset);
+    if (idLen == 0) return false;
+    offset += idLen;
+
+    const size_t valueLen = BedrockProtocol::writeVarUInt(
+      (uint32_t)value, packet + offset, sizeof(packet) - offset);
+    if (valueLen == 0) return false;
+    offset += valueLen;
+
+    return sendEncryptedBedrockPacket(peer, packet, offset);
+  }
+
+  bool sendNetworkChunkPublisherUpdate(Peer &peer, uint32_t radius) {
+    uint8_t packet[32] = {};
+    size_t offset = 0;
+
+    const size_t idLen = BedrockProtocol::writeVarUInt(
+      BEDROCK_NETWORK_CHUNK_PUBLISHER_UPDATE_ID,
+      packet + offset, sizeof(packet) - offset);
+    if (idLen == 0) return false;
+    offset += idLen;
+
+    const int publisherY = world ? world->terrainHeight(8, 8) + 1 : 24;
+    writeU32LE(packet + offset, 8); offset += 4;
+    writeU32LE(packet + offset, (uint32_t)publisherY); offset += 4;
+    writeU32LE(packet + offset, 8); offset += 4;
+
+    const size_t radiusLen = BedrockProtocol::writeVarUInt(
+      radius, packet + offset, sizeof(packet) - offset);
+    if (radiusLen == 0) return false;
+    offset += radiusLen;
+
+    return sendEncryptedBedrockPacket(peer, packet, offset);
+  }
+
+  void sendWorldBootstrap(Peer &peer, int32_t requestedRadius) {
+    const int32_t radius =
+      requestedRadius < 2 ? 2 :
+      requestedRadius > 8 ? 8 :
+      requestedRadius;
+
+    sendSimpleVarIntPacket(peer, BEDROCK_CHUNK_RADIUS_UPDATED_ID, radius);
+    sendSimpleVarIntPacket(
+      peer, BEDROCK_SET_TIME_ID,
+      world ? (int32_t)world->gameTime() : 0);
+    sendSimpleVarIntPacket(peer, BEDROCK_SET_DIFFICULTY_ID, 1);
+    sendNetworkChunkPublisherUpdate(peer, (uint32_t)radius);
+  }
+
+  void handleRequestChunkRadius(Peer &peer,
+                                const uint8_t *data,
+                                size_t length) {
+    size_t offset = 0;
+    uint32_t encodedRadius = 0;
+    if (!BedrockProtocol::readVarUInt(
+          data, length, offset, encodedRadius)) return;
+
+    const int32_t requestedRadius = (int32_t)encodedRadius;
+    Serial.printf("[BEDROCK] RequestChunkRadius radius=%ld\n",
+                  (long)requestedRadius);
+    sendWorldBootstrap(peer, requestedRadius);
   }
 
   void handleSubChunkRequest(Peer &peer,
