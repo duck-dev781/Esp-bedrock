@@ -453,8 +453,8 @@ public:
 
     uint64_t clientGuid = 0;
     uint32_t clientProtocol = 0;
-    uint32_t loginChainBytes = 0;
-    uint32_t loginSkinBytes = 0;
+    uint32_t loginAuthBytes = 0;
+    uint32_t loginClientJwtBytes = 0;
 
     IPAddress ip;
     uint16_t port = 0;
@@ -1034,11 +1034,11 @@ private:
     }
   }
 
-  bool readBedrockStringSpan(const uint8_t *data,
-                             size_t length,
-                             size_t &offset,
-                             size_t &stringOffset,
-                             uint32_t &stringLength) {
+  bool readVarStringSpan(const uint8_t *data,
+                         size_t length,
+                         size_t &offset,
+                         size_t &stringOffset,
+                         uint32_t &stringLength) {
     uint32_t lengthValue = 0;
 
     if (!BedrockProtocol::readVarUInt(
@@ -1056,15 +1056,46 @@ private:
     return true;
   }
 
+  bool readLEStringSpan(const uint8_t *data,
+                        size_t length,
+                        size_t &offset,
+                        size_t &stringOffset,
+                        uint32_t &stringLength) {
+    if (offset + 4 > length) return false;
+
+    stringLength = (uint32_t)data[offset] |
+                   ((uint32_t)data[offset + 1] << 8) |
+                   ((uint32_t)data[offset + 2] << 16) |
+                   ((uint32_t)data[offset + 3] << 24);
+    offset += 4;
+
+    if ((size_t)stringLength > length - offset) {
+      return false;
+    }
+
+    stringOffset = offset;
+    offset += stringLength;
+    return true;
+  }
+
   void handleLoginPacket(Peer &peer,
                          const uint8_t *data,
                          size_t length) {
     loginPacketsCount++;
 
-    // LoginPacket:
-    //   Protocol Version: big-endian int32
-    //   Chain Data: length-prefixed string
-    //   Skin Data: length-prefixed string
+    // Stable 1.26.51 / protocol 2193 LoginPacket:
+    //   packet id = 1 (already consumed)
+    //   Client Network Version: big-endian int32
+    //   Connection Request: string (varuint32 length)
+    //
+    // The connection-request string contains:
+    //   uint32 LE auth-jwt length
+    //   auth JWT JSON
+    //   uint32 LE client-jwt length
+    //   client JWT
+    //
+    // This matches the current Bedrock login serializers used by established
+    // protocol implementations while keeping the ESP32 parser allocation-free.
     if (length < 4) {
       Serial.println("[BEDROCK] Login packet too short.");
       return;
@@ -1073,55 +1104,78 @@ private:
     const uint32_t clientProtocol = readU32BE(data);
     size_t offset = 4;
 
-    size_t chainOffset = 0;
-    uint32_t chainLength = 0;
+    size_t connectionOffset = 0;
+    uint32_t connectionLength = 0;
 
-    if (!readBedrockStringSpan(
-          data, length, offset, chainOffset, chainLength)) {
-      Serial.println("[BEDROCK] Login chain data is malformed.");
-      return;
-    }
-
-    size_t skinOffset = 0;
-    uint32_t skinLength = 0;
-
-    if (!readBedrockStringSpan(
-          data, length, offset, skinOffset, skinLength)) {
-      Serial.println("[BEDROCK] Login skin data is malformed.");
+    if (!readVarStringSpan(
+          data, length, offset, connectionOffset, connectionLength)) {
+      Serial.println("[BEDROCK] Login connection-request string is malformed.");
       return;
     }
 
     if (offset != length) {
       Serial.printf(
-        "[BEDROCK] Login has %u trailing bytes.\n",
+        "[BEDROCK] Login has %u trailing bytes after connection request.\n",
         (unsigned)(length - offset)
+      );
+    }
+
+    const uint8_t *connection =
+      data + connectionOffset;
+    const size_t connectionBytes =
+      connectionLength;
+
+    size_t innerOffset = 0;
+    size_t authOffset = 0;
+    uint32_t authLength = 0;
+
+    if (!readLEStringSpan(
+          connection, connectionBytes,
+          innerOffset, authOffset, authLength)) {
+      Serial.println("[BEDROCK] Login auth JWT field is malformed.");
+      return;
+    }
+
+    size_t clientJwtOffset = 0;
+    uint32_t clientJwtLength = 0;
+
+    if (!readLEStringSpan(
+          connection, connectionBytes,
+          innerOffset, clientJwtOffset, clientJwtLength)) {
+      Serial.println("[BEDROCK] Login client JWT field is malformed.");
+      return;
+    }
+
+    if (innerOffset != connectionBytes) {
+      Serial.printf(
+        "[BEDROCK] Login connection request has %u trailing bytes.\n",
+        (unsigned)(connectionBytes - innerOffset)
       );
     }
 
     peer.loginReceived = true;
     peer.clientProtocol = clientProtocol;
-    peer.loginChainBytes = chainLength;
-    peer.loginSkinBytes = skinLength;
+    peer.loginAuthBytes = authLength;
+    peer.loginClientJwtBytes = clientJwtLength;
 
     if (clientProtocol == BEDROCK_PROTOCOL_VERSION) {
       loginVersionMatchesCount++;
     }
 
     Serial.printf(
-      "[BEDROCK] Login protocol=%lu chain=%lu bytes skin=%lu bytes%s\n",
+      "[BEDROCK] Login protocol=%lu auth=%lu bytes clientJwt=%lu bytes%s\n",
       (unsigned long)clientProtocol,
-      (unsigned long)chainLength,
-      (unsigned long)skinLength,
+      (unsigned long)authLength,
+      (unsigned long)clientJwtLength,
       clientProtocol == BEDROCK_PROTOCOL_VERSION
         ? " (version match)"
         : " (version differs)"
     );
 
-    // Authentication/encryption is intentionally not forged here. The next
-    // stage will validate the JWT chain, establish the Bedrock crypto session,
-    // and only then send PlayStatus/StartGame.
-    (void)chainOffset;
-    (void)skinOffset;
+    // Keep the exact JWT byte ranges available for the next stage without
+    // copying the roughly-100KB Login packet into heap memory.
+    (void)authOffset;
+    (void)clientJwtOffset;
   }
 
   void handleGameBatch(Peer &peer,
