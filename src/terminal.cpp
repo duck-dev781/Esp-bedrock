@@ -1,6 +1,7 @@
 #include "terminal.h"
 #include "espbedrock_config.h"
 #include <ESP.h>
+#include <WiFi.h>
 
 void SerialTerminal::begin(World &world) {
   worldPtr = &world;
