@@ -65,6 +65,7 @@
 #include <mbedtls/entropy.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/md.h>
+#include <mbedtls/ecdh.h>
 #include <mbedtls/sha256.h>
 #include <esp_system.h>
 
@@ -1561,7 +1562,6 @@ private:
     const int parseRc = mbedtls_pk_parse_public_key(
       &clientKey, clientDer, clientDerLength
     );
-
     if (parseRc != 0 ||
         mbedtls_pk_get_type(&clientKey) != MBEDTLS_PK_ECKEY) {
       Serial.printf("[CRYPTO] Client public-key parse failed: %d\n", parseRc);
@@ -1569,20 +1569,51 @@ private:
       return false;
     }
 
+    mbedtls_ecdh_context ecdh;
+    mbedtls_ecdh_init(&ecdh);
+
+    int rc = mbedtls_ecdh_get_params(
+      &ecdh,
+      mbedtls_pk_ec(&serverKey),
+      MBEDTLS_ECDH_OURS
+    );
+    if (rc != 0) {
+      Serial.printf("[CRYPTO] ECDH server-key import failed: %d\n", rc);
+      mbedtls_ecdh_free(&ecdh);
+      mbedtls_pk_free(&clientKey);
+      return false;
+    }
+
+    rc = mbedtls_ecdh_get_params(
+      &ecdh,
+      mbedtls_pk_ec(&clientKey),
+      MBEDTLS_ECDH_THEIRS
+    );
+    if (rc != 0) {
+      Serial.printf("[CRYPTO] ECDH client-key import failed: %d\n", rc);
+      mbedtls_ecdh_free(&ecdh);
+      mbedtls_pk_free(&clientKey);
+      return false;
+    }
+
     uint8_t sharedSecret[64] = {};
     size_t sharedLength = 0;
 
-    const int deriveRc = mbedtls_pk_derive(
-      &serverKey,
-      &clientKey,
+    rc = mbedtls_ecdh_calc_secret(
+      &ecdh,
+      &sharedLength,
       sharedSecret,
       sizeof(sharedSecret),
-      &sharedLength
+      mbedtls_ctr_drbg_random,
+      &drbg
     );
 
-    if (deriveRc != 0 || sharedLength == 0 || sharedLength > sizeof(sharedSecret)) {
-      Serial.printf("[CRYPTO] ECDH derive failed: %d\n", deriveRc);
-      mbedtls_pk_free(&clientKey);
+    mbedtls_ecdh_free(&ecdh);
+    mbedtls_pk_free(&clientKey);
+
+    if (rc != 0 || sharedLength == 0 || sharedLength > sizeof(sharedSecret)) {
+      Serial.printf("[CRYPTO] ECDH secret calculation failed: %d\n", rc);
+      memset(sharedSecret, 0, sizeof(sharedSecret));
       return false;
     }
 
@@ -1593,8 +1624,8 @@ private:
     const mbedtls_md_info_t *sha256Info =
       mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     if (sha256Info == nullptr) {
-      mbedtls_pk_free(&clientKey);
       memset(sharedSecret, 0, sizeof(sharedSecret));
+      memset(keyInput, 0, sizeof(keyInput));
       return false;
     }
 
@@ -1607,7 +1638,6 @@ private:
 
     memset(sharedSecret, 0, sizeof(sharedSecret));
     memset(keyInput, 0, sizeof(keyInput));
-    mbedtls_pk_free(&clientKey);
 
     if (hashRc != 0) {
       Serial.printf("[CRYPTO] Session-key SHA-256 failed: %d\n", hashRc);
@@ -1617,8 +1647,10 @@ private:
     mbedtls_aes_init(&peer.aesSend);
     mbedtls_aes_init(&peer.aesReceive);
 
-    if (mbedtls_aes_setkey_enc(&peer.aesSend, peer.sessionKey, 256) != 0 ||
-        mbedtls_aes_setkey_enc(&peer.aesReceive, peer.sessionKey, 256) != 0) {
+    if (mbedtls_aes_setkey_enc(
+          &peer.aesSend, peer.sessionKey, 256) != 0 ||
+        mbedtls_aes_setkey_enc(
+          &peer.aesReceive, peer.sessionKey, 256) != 0) {
       mbedtls_aes_free(&peer.aesSend);
       mbedtls_aes_free(&peer.aesReceive);
       Serial.println("[CRYPTO] AES-256 setup failed.");
@@ -1669,7 +1701,9 @@ private:
       sizeof(hash),
       derSignature,
       sizeof(derSignature),
-      &derLength
+      &derLength,
+      mbedtls_ctr_drbg_random,
+      &drbg
     );
 
     if (signRc != 0 || derLength < 8) {
@@ -2147,7 +2181,7 @@ private:
         !putBool(false) || !putBool(false) || !putString(BEDROCK_VERSION_NAME) ||
         !putI32LE(0) || !putI32LE(0) || !putBool(false) ||
         !putString("") || !putString("") || !putBool(false) ||
-        !putByte(0) || !putBool(false) || !putVarInt(0) || !putBool(false)) return false;
+        !putBool(false) || !putBool(false) || !putVarInt(0) || !putBool(false)) return false;
 
     // Level ID/name/template/trial.
     if (!putString("espbedrock-world") ||
