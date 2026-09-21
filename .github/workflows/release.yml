@@ -1,0 +1,50 @@
+name: ESP-Bedrock Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p release
+
+          # The Arduino sketch is always included in stable releases.
+          cp ESP_Bedrock.ino "release/ESP_Bedrock-\${GITHUB_REF_NAME}.ino"
+
+          # When an ESP-IDF build is added, any compiled firmware binaries
+          # placed in the repository workspace can also be published.
+          find . -type f \
+            \( -name "*.bin" -o -name "*.bin.gz" \) \
+            -not -path "./.git/*" \
+            -not -path "./release/*" \
+            -print0 |
+            while IFS= read -r -d "" file; do
+              cp "$file" "release/$(basename "$file")"
+            done
+
+          echo "Release assets:"
+          ls -lah release
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: \${{ github.token }}
+        run: |
+          gh release create "\${GITHUB_REF_NAME}" release/* \
+            --repo "\${GITHUB_REPOSITORY}" \
+            --title "ESP-Bedrock \${GITHUB_REF_NAME}" \
+            --generate-notes
