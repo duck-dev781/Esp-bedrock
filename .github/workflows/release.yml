@@ -32,6 +32,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build
+          # Arduino CLI requires the sketch's main .ino name to match the directory.
+          cp ESP_Bedrock.ino Esp-bedrock.ino
           arduino-cli compile             --fqbn esp32:esp32:esp32wrover             --output-dir build             .
           cp build/*.bin release/
 
