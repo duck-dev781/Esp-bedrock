@@ -2122,19 +2122,18 @@ private:
         !putBool(false) || !putBool(false) || !putVarInt(1) || !putI32LE(4) ||
         !putBool(false) || !putBool(false) || !putBool(false) || !putBool(false) ||
         !putBool(false) || !putBool(false) || !putBool(false) || !putBool(false) ||
-        !putBool(false) || !putString(BEDROCK_VERSION_NAME) ||
+        !putBool(false) || !putBool(false) || !putString(BEDROCK_VERSION_NAME) ||
         !putI32LE(0) || !putI32LE(0) || !putBool(false) ||
         !putString("") || !putString("") || !putBool(false) ||
-        !putVarInt(0) || !putBool(false) || !putVarInt(0) || !putBool(false)) return false;
+        !putByte(0) || !putBool(false) || !putVarInt(0) || !putBool(false)) return false;
 
     // Level ID/name/template/trial.
     if (!putString("espbedrock-world") ||
         !putString(BEDROCK_LEVEL_NAME) ||
         !putString("") || !putBool(false)) return false;
 
-    // Synced player movement settings, current tick, enchantment seed.
-    if (!putVarInt(0) || !putVarInt(0) || !putBool(false) ||
-        !putU64LE(world->gameTime()) || !putVarInt(0)) return false;
+    // Authoritative movement mode, current tick, enchantment seed.
+    if (!putVarInt(0) || !putU64LE(world->gameTime()) || !putVarInt(0)) return false;
 
     // Empty block properties; item definitions are a no-op in current codec.
     if (!putVarUInt(0) || !putString("") || !putBool(false) ||
@@ -2148,10 +2147,10 @@ private:
     packet[offset++] = 0x00;
 
     // Block registry checksum, world-template UUID, client-side generation,
-    // hashed block IDs, network permissions, logging chat.
+    // hashed block IDs, network permissions.
     if (!putU64LE(0) || !putU64LE(0) ||
         !putBool(false) || !putBool(false) ||
-        !putBool(false) || !putBool(false)) return false;
+        !putBool(false)) return false;
 
     // Server configuration join info is absent, followed by four empty IDs.
     if (!putBool(false) || !putString("") || !putString("") ||
