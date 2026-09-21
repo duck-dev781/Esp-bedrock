@@ -1,0 +1,49 @@
+name: ESP-Bedrock CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arduino-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 Arduino core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Show target board
+        run: |
+          arduino-cli board details --fqbn esp32:esp32:esp32wrover
+
+      - name: Compile ESP32-WROVER-E sketch
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32wrover \
+            --output-dir build \
+            .
+
+      - name: Upload compiled firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-bedrock-arduino-build
+          path: build/*.bin
+          if-no-files-found: error
