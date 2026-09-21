@@ -648,7 +648,7 @@ void setup() {
 
   wifiManager.begin();
 
-  wifiManager.begin();\n\n  terminal.begin(world, network);
+  terminal.begin(world, network);
 
   // The server only binds its UDP socket after a normal Wi-Fi connection.
   if (WiFi.status() == WL_CONNECTED) {
