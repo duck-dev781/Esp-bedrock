@@ -1,0 +1,11 @@
+# Original ESP-Bedrock block table
+# id<TAB>name<TAB>solid<TAB>hardness
+
+0	air	0	0
+1	stone	1	1.5
+2	grass	1	0.6
+3	dirt	1	0.5
+4	wood	1	2.0
+5	sand	1	0.5
+6	glass	1	0.3
+7	leaves	1	0.2
