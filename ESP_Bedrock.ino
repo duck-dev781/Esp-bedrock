@@ -423,7 +423,7 @@ private:
   }
 };
 
-class NetworkServer {
+class EspBedrockNetworkServer {
 public:
   struct ReliableCache {
     bool active = false;
@@ -1491,7 +1491,7 @@ private:
 
 class SerialTerminal {
 public:
-  void begin(World &w, NetworkServer &n) {
+  void begin(World &w, EspBedrockNetworkServer &n) {
     world = &w;
     network = &n;
     Serial.println();
@@ -1517,7 +1517,7 @@ public:
 private:
   String line;
   World *world = nullptr;
-  NetworkServer *network = nullptr;
+  EspBedrockNetworkServer *network = nullptr;
 
   void execute(String command) {
     command.trim();
@@ -1732,7 +1732,7 @@ private:
 };
 
 World world;
-NetworkServer network;
+EspBedrockNetworkServer network;
 SerialTerminal terminal;
 
 bool mountStorage() {
