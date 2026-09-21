@@ -84,6 +84,9 @@ The first build provides:
 - RakNet OpenConnectionRequest2/OpenConnectionReply2.
 - Basic RakNet connected-frame parsing and connected ping/pong.
 - Runtime RakNet peer tracking and statistics.
+- RakNet split-frame reassembly for large Bedrock packets.
+- PSRAM-first bounded storage for large login frames.
+- Bedrock Login packet structural parsing (protocol + chain/skin lengths).
 - Initial protocol VarUInt utilities.
 
 The Bedrock/RakNet implementation is intentionally separated from the world engine so protocol work can be expanded without rewriting the storage layer.
@@ -146,6 +149,7 @@ The sketch has the classic RakNet direct-server path on UDP 19132:
 - reliable ordered frame transmission with a small retransmit cache
 - Connected Ping/Pong
 - Bedrock NetworkSettings negotiation
+- Split-frame reassembly for large packets such as Login
 
 The current server deliberately negotiates **no compression** for stable 1.26.51 (protocol 2193), which keeps the ESP32 implementation small and avoids pulling zlib/snappy into the pre-login critical path. Mojang's 1.26.60 preview later changed the wire value for the None compression enum from 2 to 65535; 1.26.51 itself remained protocol 2193. See the current protocol changelog before changing the compatibility target.
 
@@ -153,7 +157,8 @@ A modern Bedrock release can also use NetherNet/WebRTC for some LAN scenarios. T
 
 The next layers are:
 
-1. Bedrock Login parsing and authentication.
-2. Server/client handshake and encryption.
+1. JWT chain validation and Bedrock server/client key exchange.
+2. Server/client handshake and AES-CTR session encryption.
 3. Resource-pack exchange with no proprietary bundled assets.
-4. StartGame, chunk transmission, player movement, inventory, and survival state.
+4. PlayStatus and StartGame initialization.
+5. Chunk transmission, player movement, block interaction, inventory, and survival state.
