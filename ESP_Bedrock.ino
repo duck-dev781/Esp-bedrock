@@ -441,7 +441,7 @@ public:
     size_t totalBytes = 0;
     uint32_t lastUpdate = 0;
     uint8_t *buffer = nullptr;
-    uint8_t received[RakNetMaxSplits()] = {};
+    uint8_t received[RAKNET_MAX_SPLITS] = {};
   };
 
   struct Peer {
@@ -476,10 +476,6 @@ public:
 
   static constexpr uint8_t RakNetCacheCount() {
     return RAKNET_RELIABLE_CACHE;
-  }
-
-  static constexpr uint16_t RakNetMaxSplits() {
-    return RAKNET_MAX_SPLITS;
   }
 
   bool begin() {
