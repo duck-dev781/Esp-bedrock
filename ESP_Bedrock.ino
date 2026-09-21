@@ -69,6 +69,20 @@
 #define SD_MMC_D0                 2  // FNK0047/Freenove fixed pin
 #define SD_MMC_MOUNT_POINT       "/sdcard"
 #define SD_MMC_MAX_FILES          5
+
+static const uint8_t RAKNET_MAGIC[16] = {
+  0x00, 0xFF, 0xFF, 0x00,
+  0xFE, 0xFE, 0xFE, 0xFE,
+  0xFD, 0xFD, 0xFD, 0xFD,
+  0x12, 0x34, 0x56, 0x78
+};
+
+static String u64ToDecimal(uint64_t value) {
+  char buffer[24];
+  snprintf(buffer, sizeof(buffer), "%llu",
+           (unsigned long long)value);
+  return String(buffer);
+}
 #define ESPBEDROCK_WORLD_DIR     "/espbedrock/world"
 #define ESPBEDROCK_CONFIG_DIR    "/espbedrock/config"
 #define ESPBEDROCK_ASSET_DIR     "/espbedrock/assets"
