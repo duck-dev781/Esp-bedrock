@@ -128,17 +128,32 @@ For the Freenove documentation's Arduino setup, select **ESP32 Wrover Module** a
 
 Serial monitor: **115200 baud**.
 
+### Build verification
+
+GitHub Actions compiles `ESP_Bedrock.ino` for the ESP32 WROVER target on pushes and pull requests. Tagged `v*` releases compile the same sketch again and publish the resulting `.bin` files alongside the official `.ino` in the Releases tab.
+
 The repository also keeps the modular `src/` and `include/` implementation as a development layout for future expansion.
 
 ## Network transport status
 
-The sketch now has the classic RakNet direct-server path on UDP 19132 through the offline discovery and OpenConnection stages.
+The sketch has the classic RakNet direct-server path on UDP 19132:
 
-A modern Bedrock release can also use NetherNet/WebRTC for LAN games. That transport is separate from RakNet and is being added as its own layer; it should not be confused with the direct RakNet server path.
+- offline ping/pong
+- OpenConnectionRequest1/2
+- ConnectionRequest/ConnectionRequestAccepted
+- NewIncomingConnection
+- ACK/NACK
+- reliable ordered frame transmission with a small retransmit cache
+- Connected Ping/Pong
+- Bedrock NetworkSettings negotiation
 
-The current RakNet layer is therefore a real protocol foundation, not yet a complete playable Bedrock implementation. The next layers are:
+The current server deliberately negotiates **no compression** for stable 1.26.51 (protocol 2193), which keeps the ESP32 implementation small and avoids pulling zlib/snappy into the pre-login critical path. Mojang's 1.26.60 preview later changed the wire value for the None compression enum from 2 to 65535; 1.26.51 itself remained protocol 2193. See the current protocol changelog before changing the compatibility target.
 
-1. RakNet reliable ordered frames, ACK/NACK handling, and connection acceptance.
-2. Bedrock batch/compression and login packets.
-3. Player/chunk/inventory/survival packets.
-4. NetherNet LAN discovery and WebRTC transport where required by the client version.
+A modern Bedrock release can also use NetherNet/WebRTC for some LAN scenarios. That transport is separate from the direct RakNet server path, so it will be added independently.
+
+The next layers are:
+
+1. Bedrock Login parsing and authentication.
+2. Server/client handshake and encryption.
+3. Resource-pack exchange with no proprietary bundled assets.
+4. StartGame, chunk transmission, player movement, inventory, and survival state.
