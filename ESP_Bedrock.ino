@@ -11,7 +11,8 @@
 
   Current features:
     - ESP32-WROVER-E / PSRAM awareness
-    - Wi-Fi SoftAP
+    - Wi-Fi STA/client mode (no SoftAP)
+    - Serial Wi-Fi configuration with saved credentials
     - UDP port 19132 foundation
     - SD-card persistence
     - Procedural voxel terrain API
@@ -51,8 +52,9 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include <Preferences.h>
 
-#define ESPBEDROCK_VERSION       "0.1.0"
+#define ESPBEDROCK_VERSION       "0.2.0"
 #define ESPBEDROCK_UDP_PORT      19132
 #define ESPBEDROCK_MAX_PLAYERS   4
 #define SD_CS_PIN                5
@@ -61,6 +63,7 @@
 #define ESPBEDROCK_ASSET_DIR     "/espbedrock/assets"
 #define ESPBEDROCK_WORLD_FILE    "/espbedrock/world/world.dat"
 #define ESPBEDROCK_WORLD_HEIGHT  64
+#define WIFI_CONNECT_TIMEOUT_MS 15000
 
 struct PlayerState {
   bool connected = false;
@@ -220,8 +223,9 @@ private:
 
 class SerialTerminal {
 public:
-  void begin(World &w) {
+  void begin(World &w, NetworkServer &n) {
     world = &w;
+    network = &n;
     Serial.println();
     Serial.println("ESP-Bedrock terminal ready.");
     Serial.println("Type 'help'.");
@@ -245,6 +249,7 @@ public:
 private:
   String line;
   World *world = nullptr;
+  NetworkServer *network = nullptr;
 
   void execute(String command) {
     command.trim();
@@ -276,6 +281,27 @@ private:
     else if (command.length() > 0) Serial.println("Unknown command. Type 'help'.");
   }
 
+  void cmdWifiSet(const String &value) {
+    const int split = value.indexOf('|');
+
+    if (split <= 0) {
+      Serial.println("Usage: wifi set <SSID>|<PASSWORD>");
+      Serial.println("Open network example: wifi set MyNetwork|");
+      return;
+    }
+
+    const String newSSID = value.substring(0, split);
+    const String newPassword = value.substring(split + 1);
+
+    if (newSSID.length() == 0) {
+      Serial.println("SSID cannot be empty.");
+      return;
+    }
+
+    wifiManager.setCredentials(newSSID, newPassword);
+    Serial.println("Credentials saved. Use 'wifi connect'.");
+  }
+
   void printHelp() {
     Serial.println("Commands:");
     Serial.println("  help");
@@ -286,6 +312,11 @@ private:
     Serial.println("  regen");
     Serial.println("  say <message>");
     Serial.println("  settime <0-23999>");
+    Serial.println("  wifi status");
+    Serial.println("  wifi scan");
+    Serial.println("  wifi set <SSID>|<PASSWORD>");
+    Serial.println("  wifi connect");
+    Serial.println("  wifi clear");
     Serial.println("  stop");
   }
 
@@ -374,10 +405,12 @@ void setup() {
   Serial.println();
   Serial.println("[READY] ESP-Bedrock prototype running.");
   Serial.println("[READY] Connect the serial monitor at 115200 baud.");
+  Serial.println("[READY] No SoftAP is created.");
 }
 
 void loop() {
   terminal.update();
+  network.restartIfNeeded();
   network.update();
 
   static uint32_t lastTick = 0;
