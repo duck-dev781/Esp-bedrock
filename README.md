@@ -15,14 +15,49 @@ This project is **not** the official Minecraft Bedrock Dedicated Server. It is a
 
 ## Hardware
 
-Designed around:
+Designed specifically around the Freenove FNK0047 ESP32-WROVER board:
 
-- ESP32-WROVER-E
-- PSRAM enabled
-- MicroSD card
-- Wi-Fi
+- ESP32-WROVER-E / ESP32 WROVER Module
+- PSRAM
+- Built-in microSD slot on the back of the WROVER board
+- Normal router/LAN Wi-Fi in STA/client mode
 
-The SD card is used for persistent data so the RAM footprint stays small.
+### FNK0047 SD configuration
+
+Freenove's FNK0047 documentation specifies the built-in SD slot as **SDMMC 1-bit** with fixed pins:
+
+- CLK: GPIO14
+- CMD: GPIO15
+- D0: GPIO2
+
+The single-file sketch uses:
+
+`SD_MMC.setPins(14, 15, 2)`
+
+and mounts the card at:
+
+`/sdcard`
+
+with 1-bit mode and no automatic formatting on failure. The ESP32 Arduino SD_MMC API defines the `begin` arguments as `mountpoint, mode1bit, format_if_mount_failed, frequency, maxOpenFiles`, so the safe server call is the equivalent of:
+
+`SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5)`
+
+World data and server assets are then stored at the SD card root under:
+
+```
+/espbedrock/
+  world/
+  config/
+  assets/
+```
+
+Do not change the SD pins to SPI/CS=5 for the built-in FNK0047 slot.
+
+### Wi-Fi/LAN
+
+Use normal Wi-Fi **Station/client mode**. The ESP32 joins your router and receives a LAN IP, allowing other devices on the same LAN to connect to the server. No SoftAP is created.
+
+The serial terminal can configure Wi-Fi without recompiling the sketch.
 
 ## Repository layout
 
@@ -52,7 +87,7 @@ The Bedrock/RakNet implementation is intentionally separated from the world engi
 
 ## Serial terminal
 
-After boot, open the ESP32 serial port at 115200 baud.
+After boot, open the ESP32 serial port at **115200 baud**. Set the line ending to **Newline**.
 
 Commands:
 
@@ -65,6 +100,14 @@ save
 regen
 say <message>
 settime <0-23999>
+wifi status
+wifi scan
+wifi set <SSID>|<PASSWORD>
+wifi connect
+wifi clear
+lan
+sd status
+sd ls
 stop
 ```
 
@@ -78,7 +121,7 @@ The easiest starting point is the single-file Arduino sketch:
 
 `ESP_Bedrock.ino`
 
-Open it in Arduino IDE, select an ESP32-WROVER-E-compatible board, enable PSRAM when the board definition exposes that option, and upload it.
+For the Freenove documentation's Arduino setup, select **ESP32 Wrover Module** and use the ESP32 Arduino board package. Freenove's current FNK0047 tutorial documents ESP32 package **3.0.x** and uses 115200 baud for the serial monitor.
 
 Serial monitor: **115200 baud**.
 
