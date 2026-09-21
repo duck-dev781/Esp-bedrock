@@ -55,7 +55,7 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 
-#define ESPBEDROCK_VERSION       "0.3.0"
+#define ESPBEDROCK_VERSION       "0.3.1"
 #define ESPBEDROCK_UDP_PORT      19132
 #define ESPBEDROCK_HOSTNAME       "esp-bedrock"
 #define ESPBEDROCK_MAX_PLAYERS   4
@@ -106,7 +106,7 @@ public:
       return;
     }
 
-    Serial.printf("[WIFI] Saved network: %s\\n", ssid.c_str());
+    Serial.printf("[WIFI] Saved network: %s\n", ssid.c_str());
     connect();
   }
 
@@ -147,7 +147,7 @@ public:
       return true;
     }
 
-    Serial.printf("[WIFI] Connection failed. status=%d\\n",
+    Serial.printf("[WIFI] Connection failed. status=%d\n",
                   (int)WiFi.status());
     return false;
   }
@@ -160,7 +160,7 @@ public:
     preferences.putString("ssid", ssid);
     preferences.putString("pass", password);
 
-    Serial.printf("[WIFI] Saved SSID: %s\\n", ssid.c_str());
+    Serial.printf("[WIFI] Saved SSID: %s\n", ssid.c_str());
     Serial.println("[WIFI] Password saved.");
   }
 
@@ -175,9 +175,9 @@ public:
 
   void printStatus() const {
     Serial.println("Mode: STA/client");
-    Serial.printf("Configured SSID: %s\\n",
+    Serial.printf("Configured SSID: %s\n",
                   ssid.length() ? ssid.c_str() : "(none)");
-    Serial.printf("Status: %s\\n", statusText());
+    Serial.printf("Status: %s\n", statusText());
 
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("IP: ");
@@ -213,11 +213,11 @@ public:
       return;
     }
 
-    Serial.printf("[WIFI] Found %d network(s):\\n", count);
+    Serial.printf("[WIFI] Found %d network(s):\n", count);
 
     for (int i = 0; i < count; ++i) {
       Serial.printf(
-        "  %d: %s  RSSI=%d  %s\\n",
+        "  %d: %s  RSSI=%d  %s\n",
         i + 1,
         WiFi.SSID(i).c_str(),
         WiFi.RSSI(i),
@@ -404,7 +404,7 @@ public:
     serverRunning = udp.begin(ESPBEDROCK_UDP_PORT) == 1;
 
     if (serverRunning) {
-      Serial.printf("[NET] UDP listener active on %u\\n",
+      Serial.printf("[NET] UDP listener active on %u\n",
                     ESPBEDROCK_UDP_PORT);
     }
 
@@ -434,7 +434,7 @@ public:
     const size_t n = udp.read(buffer, sizeof(buffer));
     rxPackets++;
 
-    Serial.printf("[UDP] %u bytes from %s:%u\\n",
+    Serial.printf("[UDP] %u bytes from %s:%u\n",
                   (unsigned)n,
                   udp.remoteIP().toString().c_str(),
                   (unsigned)udp.remotePort());
@@ -444,7 +444,7 @@ public:
       uint32_t firstVarUInt = 0;
 
       if (BedrockProtocol::readVarUInt(buffer, n, offset, firstVarUInt)) {
-        Serial.printf("[PROTO] first varuint=0x%08lX\\n",
+        Serial.printf("[PROTO] first varuint=0x%08lX\n",
                       (unsigned long)firstVarUInt);
       }
     }
@@ -529,6 +529,12 @@ private:
     else if (command == "lan") {
       wifiManager.printLanInfo();
     }
+    else if (command == "sd status") {
+      cmdSDStatus();
+    }
+    else if (command == "sd ls") {
+      cmdSDList();
+    }
     else if (command.startsWith("wifi set ")) {
       cmdWifiSet(command.substring(9));
     }
@@ -577,7 +583,75 @@ private:
     Serial.println("  wifi connect");
     Serial.println("  wifi clear");
     Serial.println("  lan");
+    Serial.println("  sd status");
+    Serial.println("  sd ls");
     Serial.println("  stop");
+  }
+
+  void cmdSDStatus() {
+    const uint8_t type = SD_MMC.cardType();
+
+    if (type == CARD_NONE) {
+      Serial.println("[SD] Not mounted.");
+      return;
+    }
+
+    Serial.println("[SD] FNK0047 SDMMC 1-bit mode");
+    Serial.println("[SD] CLK=GPIO14 CMD=GPIO15 D0=GPIO2");
+    Serial.printf("[SD] Capacity: %llu MB\n",
+                  SD_MMC.cardSize() / (1024ULL * 1024ULL));
+    Serial.printf("[SD] Total: %llu MB\n",
+                  SD_MMC.totalBytes() / (1024ULL * 1024ULL));
+    Serial.printf("[SD] Used: %llu MB\n",
+                  SD_MMC.usedBytes() / (1024ULL * 1024ULL));
+    Serial.println("[SD] Root directories:");
+    Serial.println("  /espbedrock/world");
+    Serial.println("  /espbedrock/config");
+    Serial.println("  /espbedrock/assets");
+  }
+
+  void cmdSDList() {
+    if (SD_MMC.cardType() == CARD_NONE) {
+      Serial.println("[SD] Not mounted.");
+      return;
+    }
+
+    listSDDirectory("/", 0);
+  }
+
+  void listSDDirectory(const char *dirname, uint8_t depth) {
+    if (depth > 3) return;
+
+    File root = SD_MMC.open(dirname);
+    if (!root || !root.isDirectory()) {
+      Serial.printf("[SD] Cannot open %s\n", dirname);
+      return;
+    }
+
+    File entry = root.openNextFile();
+
+    while (entry) {
+      for (uint8_t i = 0; i < depth; ++i) {
+        Serial.print("  ");
+      }
+
+      Serial.print(entry.name());
+
+      if (entry.isDirectory()) {
+        Serial.println("/");
+        const String child = entry.name();
+        entry.close();
+        listSDDirectory(child.c_str(), depth + 1);
+      } else {
+        Serial.printf("  (%llu bytes)\n",
+                      (unsigned long long)entry.size());
+        entry.close();
+      }
+
+      entry = root.openNextFile();
+    }
+
+    root.close();
   }
 
   void cmdStatus() {
@@ -616,7 +690,7 @@ bool mountStorage() {
 
   if (!SD_MMC.begin(
         SD_MMC_MOUNT_POINT,
-        true,                   // format if mount fails
+        false,                  // NEVER auto-format the world SD card
         true,                   // 1-bit mode
         SDMMC_FREQ_DEFAULT,     // Freenove's documented setting
         SD_MMC_MAX_FILES)) {
@@ -648,17 +722,17 @@ bool mountStorage() {
   }
 
   Serial.printf(
-    "[SD] Capacity: %llu MB\\n",
+    "[SD] Capacity: %llu MB\n",
     SD_MMC.cardSize() / (1024ULL * 1024ULL)
   );
 
   Serial.printf(
-    "[SD] Total: %llu MB\\n",
+    "[SD] Total: %llu MB\n",
     SD_MMC.totalBytes() / (1024ULL * 1024ULL)
   );
 
   Serial.printf(
-    "[SD] Used: %llu MB\\n",
+    "[SD] Used: %llu MB\n",
     SD_MMC.usedBytes() / (1024ULL * 1024ULL)
   );
 
@@ -673,7 +747,7 @@ bool mountStorage() {
 void printBootInfo() {
   Serial.println();
   Serial.println("======================================");
-  Serial.println("          ESP-BEDROCK 0.3.0");
+  Serial.println("          ESP-BEDROCK 0.3.1");
   Serial.println("======================================");
   Serial.println("Target: ESP32-WROVER-E");
   Serial.printf("Chip cores: %d\n", ESP.getChipCores());
