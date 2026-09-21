@@ -77,6 +77,164 @@ struct PlayerState {
   uint16_t hunger = 20;
 };
 
+class WiFiManager {
+public:
+  void begin() {
+    preferences.begin("espbedrock", false);
+
+    ssid = preferences.getString("ssid", "");
+    password = preferences.getString("pass", "");
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false);
+
+    Serial.println("[WIFI] STA/client mode only.");
+    Serial.println("[WIFI] No SoftAP is created.");
+
+    if (ssid.length() == 0) {
+      Serial.println("[WIFI] No saved network.");
+      Serial.println("[WIFI] Use: wifi scan");
+      Serial.println("[WIFI] Then: wifi set <SSID>|<PASSWORD>");
+      Serial.println("[WIFI] Then: wifi connect");
+      return;
+    }
+
+    Serial.printf("[WIFI] Saved network: %s\\n", ssid.c_str());
+    connect();
+  }
+
+  bool connect() {
+    if (ssid.length() == 0) {
+      Serial.println("[WIFI] No SSID configured.");
+      return false;
+    }
+
+    Serial.printf("[WIFI] Connecting to %s", ssid.c_str());
+
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(ssid.c_str(), password.c_str());
+
+    const uint32_t start = millis();
+
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+      delay(250);
+      Serial.print(".");
+    }
+
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("[WIFI] Connected. IP: ");
+      Serial.println(WiFi.localIP());
+
+      Serial.print("[WIFI] Gateway: ");
+      Serial.println(WiFi.gatewayIP());
+
+      Serial.print("[WIFI] RSSI: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+      return true;
+    }
+
+    Serial.printf("[WIFI] Connection failed. status=%d\\n",
+                  (int)WiFi.status());
+    return false;
+  }
+
+  void setCredentials(const String &newSSID,
+                      const String &newPassword) {
+    ssid = newSSID;
+    password = newPassword;
+
+    preferences.putString("ssid", ssid);
+    preferences.putString("pass", password);
+
+    Serial.printf("[WIFI] Saved SSID: %s\\n", ssid.c_str());
+    Serial.println("[WIFI] Password saved.");
+  }
+
+  void clearCredentials() {
+    preferences.clear();
+    ssid = "";
+    password = "";
+
+    WiFi.disconnect(true);
+    Serial.println("[WIFI] Saved credentials cleared.");
+  }
+
+  void printStatus() const {
+    Serial.println("Mode: STA/client");
+    Serial.printf("Configured SSID: %s\\n",
+                  ssid.length() ? ssid.c_str() : "(none)");
+    Serial.printf("Status: %s\\n", statusText());
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+
+      Serial.print("Gateway: ");
+      Serial.println(WiFi.gatewayIP());
+
+      Serial.print("RSSI: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+    }
+  }
+
+  void scan() {
+    Serial.println("[WIFI] Scanning...");
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+
+    const int count = WiFi.scanNetworks(false, true);
+
+    if (count < 0) {
+      Serial.println("[WIFI] Scan failed.");
+      return;
+    }
+
+    Serial.printf("[WIFI] Found %d network(s):\\n", count);
+
+    for (int i = 0; i < count; ++i) {
+      Serial.printf(
+        "  %d: %s  RSSI=%d  %s\\n",
+        i + 1,
+        WiFi.SSID(i).c_str(),
+        WiFi.RSSI(i),
+        WiFi.encryptionType(i) == WIFI_AUTH_OPEN
+          ? "open"
+          : "secured"
+      );
+    }
+
+    WiFi.scanDelete();
+  }
+
+  const char *statusText() const {
+    switch (WiFi.status()) {
+      case WL_CONNECTED:       return "connected";
+      case WL_NO_SSID_AVAIL:   return "SSID not found";
+      case WL_CONNECT_FAILED:  return "connection failed";
+      case WL_CONNECTION_LOST: return "connection lost";
+      case WL_DISCONNECTED:    return "disconnected";
+      case WL_IDLE_STATUS:     return "idle";
+      default:                 return "unknown";
+    }
+  }
+
+private:
+  Preferences preferences;
+  String ssid;
+  String password;
+};
+
+WiFiManager wifiManager;
+
 namespace BedrockProtocol {
 size_t writeVarUInt(uint32_t value, uint8_t *out, size_t capacity) {
   size_t i = 0;
@@ -443,7 +601,7 @@ void setup() {
 
   wifiManager.begin();
 
-  terminal.begin(world, network);
+  wifiManager.begin();\n\n  terminal.begin(world, network);
 
   // The server only binds its UDP socket after a normal Wi-Fi connection.
   if (WiFi.status() == WL_CONNECTED) {
