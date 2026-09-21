@@ -471,7 +471,7 @@ public:
     bool haveExpectedDatagramSequence = false;
 
     SplitAssembly split;
-    ReliableCache reliable[RakNetCacheCount()];
+    ReliableCache reliable[RAKNET_RELIABLE_CACHE];
   };
 
   static constexpr uint8_t RakNetCacheCount() {
@@ -687,6 +687,161 @@ private:
     }
 
     writeU16BE(out + 5, port);
+  }
+
+  void handleUnconnectedPing(const uint8_t *data,
+                              size_t length,
+                              const IPAddress &ip,
+                              uint16_t port) {
+    if (length < 25) return;
+    if (!magicOK(data, 9, length)) return;
+
+    const uint64_t pingTime = readU64BE(data + 1);
+
+    uint8_t response[512];
+    size_t offset = 0;
+
+    response[offset++] = 0x1C;
+    writeU64BE(response + offset, pingTime);
+    offset += 8;
+    writeU64BE(response + offset, serverGuid);
+    offset += 8;
+    memcpy(response + offset, RAKNET_MAGIC, sizeof(RAKNET_MAGIC));
+    offset += sizeof(RAKNET_MAGIC);
+
+    const String motd =
+      "MCPE;ESP-Bedrock;" +
+      String(BEDROCK_PROTOCOL_VERSION) + ";" +
+      BEDROCK_VERSION_NAME + ";" +
+      String((unsigned)activePeers()) + ";" +
+      String(ESPBEDROCK_MAX_PLAYERS) + ";" +
+      u64ToDecimal(serverGuid) + ";" +
+      BEDROCK_LEVEL_NAME + ";Survival;1;19132;19133;";
+
+    const size_t motdLength = motd.length();
+
+    if (motdLength > 480 || offset + 2 + motdLength > sizeof(response)) {
+      return;
+    }
+
+    writeU16BE(response + offset, (uint16_t)motdLength);
+    offset += 2;
+
+    memcpy(response + offset, motd.c_str(), motdLength);
+    offset += motdLength;
+
+    sendPacket(response, offset, ip, port);
+    pingsAnsweredCount++;
+  }
+
+  void handleOpenConnectionRequest1(const uint8_t *data,
+                                    size_t length,
+                                    const IPAddress &ip,
+                                    uint16_t port) {
+    if (length < 18) return;
+    if (!magicOK(data, 1, length)) return;
+
+    const uint8_t clientRakNetVersion = data[17];
+
+    if (clientRakNetVersion != RAKNET_PROTOCOL_VERSION) {
+      uint8_t response[19];
+      size_t offset = 0;
+
+      response[offset++] = 0x19;
+      response[offset++] = RAKNET_PROTOCOL_VERSION;
+      memcpy(response + offset, RAKNET_MAGIC, sizeof(RAKNET_MAGIC));
+      offset += sizeof(RAKNET_MAGIC);
+
+      sendPacket(response, offset, ip, port);
+      Serial.printf(
+        "[RAKNET] Incompatible protocol %u from %s:%u\n",
+        (unsigned)clientRakNetVersion,
+        ip.toString().c_str(),
+        (unsigned)port
+      );
+      return;
+    }
+
+    const uint16_t discoveredMtu =
+      (uint16_t)min((size_t)RAKNET_MAX_MTU, length + 28U);
+
+    uint8_t response[32];
+    size_t offset = 0;
+
+    response[offset++] = 0x06;
+    memcpy(response + offset, RAKNET_MAGIC, sizeof(RAKNET_MAGIC));
+    offset += sizeof(RAKNET_MAGIC);
+    writeU64BE(response + offset, serverGuid);
+    offset += 8;
+
+    // RakNet security is disabled at this layer. Bedrock session encryption
+    // is negotiated later through the Bedrock login handshake.
+    response[offset++] = 0;
+    writeU16BE(response + offset, discoveredMtu);
+    offset += 2;
+
+    sendPacket(response, offset, ip, port);
+    handshakeCount++;
+  }
+
+  void handleOpenConnectionRequest2(const uint8_t *data,
+                                    size_t length,
+                                    const IPAddress &ip,
+                                    uint16_t port) {
+    // With server-level RakNet security disabled, Request2 is:
+    // id + magic + server address + mtu + client GUID.
+    if (length < 34) return;
+    if (!magicOK(data, 1, length)) return;
+
+    const uint16_t requestedMtu = readU16BE(data + 24);
+    const uint64_t clientGuid = readU64BE(data + 26);
+
+    const uint16_t mtu =
+      (uint16_t)constrain(
+        (int)requestedMtu,
+        576,
+        RAKNET_MAX_MTU
+      );
+
+    Peer *peer = allocatePeer(ip, port, clientGuid);
+
+    if (!peer) {
+      Serial.println("[RAKNET] Peer table full; rejecting Request2.");
+      return;
+    }
+
+    peer->mtu = mtu;
+    peer->openConnection = true;
+    peer->lastSeen = millis();
+
+    uint8_t response[40];
+    size_t offset = 0;
+
+    response[offset++] = 0x08;
+    memcpy(response + offset, RAKNET_MAGIC, sizeof(RAKNET_MAGIC));
+    offset += sizeof(RAKNET_MAGIC);
+
+    writeU64BE(response + offset, serverGuid);
+    offset += 8;
+
+    writeRakAddress(response + offset, ip, port);
+    offset += 7;
+
+    writeU16BE(response + offset, mtu);
+    offset += 2;
+
+    response[offset++] = 0;
+
+    sendPacket(response, offset, ip, port);
+    handshakeCount++;
+
+    Serial.printf(
+      "[RAKNET] OpenConnectionRequest2 guid=%s mtu=%u from %s:%u\n",
+      u64ToDecimal(clientGuid).c_str(),
+      (unsigned)mtu,
+      ip.toString().c_str(),
+      (unsigned)port
+    );
   }
 
   Peer *findPeer(const IPAddress &ip, uint16_t port, uint64_t guid = 0) {
