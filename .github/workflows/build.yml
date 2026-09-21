@@ -35,11 +35,13 @@ jobs:
       - name: Compile ESP32-WROVER-E sketch
         run: |
           set -euo pipefail
-          mkdir -p build
+          rm -rf .ci
+          mkdir -p .ci/ESP_Bedrock build
+          cp ESP_Bedrock.ino .ci/ESP_Bedrock/ESP_Bedrock.ino
           arduino-cli compile \
             --fqbn esp32:esp32:esp32wrover \
             --output-dir build \
-            .
+            .ci/ESP_Bedrock
 
       - name: Upload compiled firmware
         uses: actions/upload-artifact@v4
