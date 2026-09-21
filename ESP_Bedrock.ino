@@ -690,8 +690,8 @@ bool mountStorage() {
 
   if (!SD_MMC.begin(
         SD_MMC_MOUNT_POINT,
-        false,                  // NEVER auto-format the world SD card
         true,                   // 1-bit mode
+        false,                  // NEVER auto-format the world SD card
         SDMMC_FREQ_DEFAULT,     // Freenove's documented setting
         SD_MMC_MAX_FILES)) {
     Serial.println("[SD] SDMMC mount failed.");
