@@ -1454,7 +1454,29 @@ private:
     memcpy(payload + offset, &throttleScalar, sizeof(throttleScalar));
     offset += sizeof(throttleScalar);
 
-    sendReliableOrdered(peer, payload, offset);
+    uint8_t framed[40] = {};
+    size_t framedOffset = 0;
+    framed[framedOffset++] = BEDROCK_GAME_PACKET_ID;
+
+    uint8_t lengthBytes[5] = {};
+    const size_t lengthBytesCount =
+      BedrockProtocol::writeVarUInt(
+        (uint32_t)offset,
+        lengthBytes,
+        sizeof(lengthBytes)
+      );
+
+    if (lengthBytesCount == 0 ||
+        framedOffset + lengthBytesCount + offset > sizeof(framed)) {
+      return;
+    }
+
+    memcpy(framed + framedOffset, lengthBytes, lengthBytesCount);
+    framedOffset += lengthBytesCount;
+    memcpy(framed + framedOffset, payload, offset);
+    framedOffset += offset;
+
+    sendReliableOrdered(peer, framed, framedOffset);
     peer.networkSettingsSent = true;
     networkSettingsRequestsCount++;
   }
