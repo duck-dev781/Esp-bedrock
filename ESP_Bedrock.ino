@@ -53,9 +53,11 @@
 #include <SD.h>
 #include <FS.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
 
 #define ESPBEDROCK_VERSION       "0.2.0"
 #define ESPBEDROCK_UDP_PORT      19132
+#define ESPBEDROCK_HOSTNAME       "esp-bedrock"
 #define ESPBEDROCK_MAX_PLAYERS   4
 #define SD_CS_PIN                5
 #define ESPBEDROCK_WORLD_DIR     "/espbedrock/world"
@@ -136,6 +138,8 @@ public:
       Serial.print("[WIFI] RSSI: ");
       Serial.print(WiFi.RSSI());
       Serial.println(" dBm");
+
+      startMDNS();
       return true;
     }
 
@@ -175,6 +179,13 @@ public:
       Serial.print("IP: ");
       Serial.println(WiFi.localIP());
 
+      Serial.print("Port: ");
+      Serial.println(ESPBEDROCK_UDP_PORT);
+
+      Serial.print("Hostname: ");
+      Serial.print(ESPBEDROCK_HOSTNAME);
+      Serial.println(".local");
+
       Serial.print("Gateway: ");
       Serial.println(WiFi.gatewayIP());
 
@@ -213,6 +224,38 @@ public:
     }
 
     WiFi.scanDelete();
+  }
+
+  bool startMDNS() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    if (MDNS.begin(ESPBEDROCK_HOSTNAME)) {
+      MDNS.addService("minecraft", "udp", ESPBEDROCK_UDP_PORT);
+      Serial.print("[LAN] mDNS: ");
+      Serial.print(ESPBEDROCK_HOSTNAME);
+      Serial.println(".local");
+      return true;
+    }
+
+    Serial.println("[LAN] mDNS startup failed.");
+    return false;
+  }
+
+  void printLanInfo() const {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[LAN] ESP32 is not connected to the LAN.");
+      return;
+    }
+
+    Serial.println("[LAN] Local network information:");
+    Serial.print("  IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("  UDP port: ");
+    Serial.println(ESPBEDROCK_UDP_PORT);
+    Serial.print("  mDNS: ");
+    Serial.print(ESPBEDROCK_HOSTNAME);
+    Serial.println(".local");
+    Serial.println("  Clients on the same LAN can target the ESP32 IP and port.");
   }
 
   const char *statusText() const {
@@ -479,6 +522,9 @@ private:
       wifiManager.clearCredentials();
       network->restartIfNeeded();
     }
+    else if (command == "lan") {
+      wifiManager.printLanInfo();
+    }
     else if (command.startsWith("wifi set ")) {
       cmdWifiSet(command.substring(9));
     }
@@ -526,6 +572,7 @@ private:
     Serial.println("  wifi set <SSID>|<PASSWORD>");
     Serial.println("  wifi connect");
     Serial.println("  wifi clear");
+    Serial.println("  lan");
     Serial.println("  stop");
   }
 
@@ -605,6 +652,7 @@ void setup() {
 
   // The server only binds its UDP socket after a normal Wi-Fi connection.
   if (WiFi.status() == WL_CONNECTED) {
+    wifiManager.startMDNS();
     network.begin();
   }
 
