@@ -26,6 +26,9 @@
     - RakNet session handshake
     - RakNet split-frame reassembly
     - Bedrock login/session packet parsing
+    - P-384/ECDH/AES-CTR session encryption
+    - resource-pack handshake with no bundled packs
+    - StartGame/world initialization
     - chunk serialization
     - player movement
     - block break/place
@@ -55,8 +58,17 @@
 #include <FS.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+#include <mbedtls/aes.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/ecp.h>
+#include <mbedtls/ecdsa.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/sha512.h>
+#include <esp_system.h>
 
-#define ESPBEDROCK_VERSION       "0.5.1"
+#define ESPBEDROCK_VERSION       "0.6.0"
 #define ESPBEDROCK_UDP_PORT      19132
 #define ESPBEDROCK_HOSTNAME       "esp-bedrock"
 #define ESPBEDROCK_MAX_PLAYERS   4
@@ -74,6 +86,13 @@
 #define BEDROCK_NETWORK_SETTINGS_ID 143
 #define BEDROCK_GAME_PACKET_ID 0xFE
 #define BEDROCK_BATCH_NONE 0xFF
+#define BEDROCK_PLAY_STATUS_ID 2
+#define BEDROCK_SERVER_TO_CLIENT_HANDSHAKE_ID 3
+#define BEDROCK_CLIENT_TO_SERVER_HANDSHAKE_ID 4
+#define BEDROCK_RESOURCE_PACKS_INFO_ID 6
+#define BEDROCK_RESOURCE_PACK_STACK_ID 7
+#define BEDROCK_RESOURCE_PACK_CLIENT_RESPONSE_ID 8
+#define BEDROCK_START_GAME_ID 11
 // Stable 1.26.51 uses the pre-1.26.60 enum value for "None".
 #define BEDROCK_COMPRESSION_NONE 2
 #define SD_MMC_CMD               15  // FNK0047/Freenove fixed pin
@@ -326,6 +345,18 @@ size_t writeVarUInt(uint32_t value, uint8_t *out, size_t capacity) {
   }
 }
 
+size_t writeVarUInt64(uint64_t value, uint8_t *out, size_t capacity) {
+  size_t i = 0;
+  while (true) {
+    if (i >= capacity || i >= 10) return 0;
+    uint8_t byte = value & 0x7F;
+    value >>= 7;
+    if (value != 0) byte |= 0x80;
+    out[i++] = byte;
+    if (value == 0) return i;
+  }
+}
+
 bool readVarUInt(const uint8_t *data, size_t length, size_t &offset,
                  uint32_t &value) {
   value = 0;
@@ -338,6 +369,162 @@ bool readVarUInt(const uint8_t *data, size_t length, size_t &offset,
   }
   return false;
 }
+
+bool writeString(const char *value, uint8_t *out, size_t capacity, size_t &written) {
+  const size_t len = strlen(value);
+  uint8_t prefix[5];
+  const size_t prefixLen = writeVarUInt((uint32_t)len, prefix, sizeof(prefix));
+  if (prefixLen == 0 || prefixLen + len > capacity) return false;
+  memcpy(out, prefix, prefixLen);
+  memcpy(out + prefixLen, value, len);
+  written = prefixLen + len;
+  return true;
+}
+
+bool writeString(const String &value, uint8_t *out, size_t capacity, size_t &written) {
+  return writeString(value.c_str(), out, capacity, written);
+}
+}
+
+static const char BASE64_STD[] =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static String base64Encode(const uint8_t *data, size_t length, bool urlSafe) {
+  String out;
+  out.reserve(((length + 2) / 3) * 4);
+  for (size_t i = 0; i < length; i += 3) {
+    const uint32_t v =
+      ((uint32_t)data[i] << 16) |
+      ((uint32_t)((i + 1 < length) ? data[i + 1] : 0) << 8) |
+      (uint32_t)((i + 2 < length) ? data[i + 2] : 0);
+    const uint8_t a = (v >> 18) & 0x3F;
+    const uint8_t b = (v >> 12) & 0x3F;
+    const uint8_t d = v & 0x3F;
+    const uint8_t e = (v >> 6) & 0x3F;
+    auto enc = [urlSafe](uint8_t ch) -> char {
+      if (!urlSafe) return BASE64_STD[ch];
+      if (ch == 62) return '-';
+      if (ch == 63) return '_';
+      return BASE64_STD[ch];
+    };
+    out += enc(a);
+    out += enc(b);
+    if (i + 1 < length) out += enc(e);
+    if (i + 2 < length) out += enc(d);
+  }
+  if (!urlSafe) while ((out.length() % 4) != 0) out += '=';
+  return out;
+}
+
+static int base64Value(char ch) {
+  if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+  if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+  if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+  if (ch == '+' || ch == '-') return 62;
+  if (ch == '/' || ch == '_') return 63;
+  return -1;
+}
+
+static bool base64Decode(const String &input, uint8_t *out, size_t capacity, size_t &written) {
+  written = 0;
+  uint32_t accumulator = 0;
+  uint8_t bits = 0;
+  for (size_t i = 0; i < input.length(); ++i) {
+    const char ch = input[i];
+    if (ch == '=') break;
+    if (ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t') continue;
+    const int v = base64Value(ch);
+    if (v < 0) return false;
+    accumulator = ((accumulator << 6) | (uint32_t)v) & 0xFFFFFFUL;
+    bits += 6;
+    while (bits >= 8) {
+      bits -= 8;
+      if (written >= capacity) return false;
+      out[written++] = (uint8_t)((accumulator >> bits) & 0xFF);
+    }
+  }
+  return true;
+}
+
+static bool extractJsonStringField(const uint8_t *data,
+                                   size_t length,
+                                   const char *key,
+                                   String &value) {
+  const size_t keyLen = strlen(key);
+  for (size_t i = 0; i + keyLen <= length; ++i) {
+    if (memcmp(data + i, key, keyLen) != 0) continue;
+    size_t p = i + keyLen;
+    while (p < length && (data[p] == ' ' || data[p] == '\t' ||
+                          data[p] == '\r' || data[p] == '\n')) ++p;
+    if (p >= length || data[p] != ':') continue;
+    ++p;
+    while (p < length && (data[p] == ' ' || data[p] == '\t' ||
+                          data[p] == '\r' || data[p] == '\n')) ++p;
+    if (p < length && data[p] == '\\') ++p;
+    if (p >= length || data[p] != '"') continue;
+    ++p;
+
+    String result;
+    while (p < length) {
+      if (data[p] == '\\' && p + 1 < length) {
+        const uint8_t next = data[p + 1];
+        if (next == '"' || next == '\\' || next == '/') {
+          result += (char)next;
+          p += 2;
+          continue;
+        }
+      }
+      if (data[p] == '"') {
+        value = result;
+        return true;
+      }
+      result += (char)data[p++];
+      if (result.length() > 1024) return false;
+    }
+  }
+  return false;
+}
+
+static bool extractJwtHeaderX5u(const uint8_t *jwt,
+                                size_t jwtLength,
+                                String &x5u) {
+  size_t dot = 0;
+  while (dot < jwtLength && jwt[dot] != '.') ++dot;
+  if (dot == 0 || dot >= jwtLength) return false;
+
+  String header;
+  header.reserve(dot);
+  for (size_t i = 0; i < dot; ++i) header += (char)jwt[i];
+
+  uint8_t decoded[2048];
+  size_t decodedLength = 0;
+  if (!base64Decode(header, decoded, sizeof(decoded), decodedLength)) return false;
+  return extractJsonStringField(decoded, decodedLength, "x5u", x5u);
+}
+
+static bool findClientPublicKey(const uint8_t *authJwt,
+                                size_t authLength,
+                                const uint8_t *clientJwt,
+                                size_t clientJwtLength,
+                                uint8_t *der,
+                                size_t derCapacity,
+                                size_t &derLength,
+                                String &source) {
+  String candidate;
+  if (extractJwtHeaderX5u(clientJwt, clientJwtLength, candidate) &&
+      base64Decode(candidate, der, derCapacity, derLength)) {
+    source = "client JWT x5u";
+    return true;
+  }
+
+  if ((extractJsonStringField(authJwt, authLength, "identityPublicKey", candidate) ||
+       extractJsonStringField(authJwt, authLength, "cpk", candidate)) &&
+      base64Decode(candidate, der, derCapacity, derLength)) {
+    source = "auth JWT public key claim";
+    return true;
+  }
+
+  return false;
 }
 
 class World {
@@ -450,6 +637,13 @@ public:
     bool established = false;
     bool networkSettingsSent = false;
     bool loginReceived = false;
+    bool handshakeSent = false;
+    bool encryptionReady = false;
+    bool resourcePacksInfoSent = false;
+    bool resourcePackStackSent = false;
+    bool startGameSent = false;
+    bool playerSpawnSent = false;
+    bool aesInitialized = false;
 
     uint64_t clientGuid = 0;
     uint32_t clientProtocol = 0;
@@ -472,13 +666,38 @@ public:
 
     SplitAssembly split;
     ReliableCache reliable[RAKNET_RELIABLE_CACHE];
+
+    uint16_t nextSplitId = 1;
+    uint64_t sendPacketCounter = 0;
+    uint64_t receivePacketCounter = 0;
+    uint8_t encryptionSalt[16] = {};
+    uint8_t sessionKey[32] = {};
+    mbedtls_aes_context aesSend;
+    mbedtls_aes_context aesReceive;
+    size_t aesSendOffset = 0;
+    size_t aesReceiveOffset = 0;
+    uint8_t aesSendStream[16] = {};
+    uint8_t aesReceiveStream[16] = {};
+    uint8_t aesSendNonce[16] = {};
+    uint8_t aesReceiveNonce[16] = {};
   };
 
   static constexpr uint8_t RakNetCacheCount() {
     return RAKNET_RELIABLE_CACHE;
   }
 
+  void attachWorld(World &w) {
+    world = &w;
+  }
+
+  uint32_t encryptedPacketsSent() const { return encryptedPacketsSentCount; }
+  uint32_t encryptedPacketsReceived() const { return encryptedPacketsReceivedCount; }
+  uint32_t resourcePackResponses() const { return resourcePackResponsesCount; }
+  uint32_t startGamePacketsSent() const { return startGamePacketsSentCount; }
+
   bool begin() {
+    ensureCrypto();
+
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("[NET] Wi-Fi is not connected. RakNet listener not started.");
       serverRunning = false;
@@ -601,6 +820,20 @@ private:
   uint32_t networkSettingsRequestsCount = 0;
   uint32_t loginPacketsCount = 0;
   uint32_t loginVersionMatchesCount = 0;
+  uint32_t encryptedPacketsSentCount = 0;
+  uint32_t encryptedPacketsReceivedCount = 0;
+  uint32_t resourcePackResponsesCount = 0;
+  uint32_t startGamePacketsSentCount = 0;
+
+  World *world = nullptr;
+
+  mbedtls_pk_context serverKey;
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context drbg;
+  bool cryptoInitialized = false;
+  uint8_t serverPubKeyDer[256] = {};
+  size_t serverPubKeyDerLength = 0;
+  String serverPubKeyBase64;
 
   Peer peers[ESPBEDROCK_MAX_PLAYERS];
 
@@ -871,8 +1104,17 @@ private:
     split = SplitAssembly{};
   }
 
+  void clearPeerCrypto(Peer &peer) {
+    if (peer.aesInitialized) {
+      mbedtls_aes_free(&peer.aesSend);
+      mbedtls_aes_free(&peer.aesReceive);
+      peer.aesInitialized = false;
+    }
+  }
+
   void resetPeer(Peer &peer) {
     clearSplitAssembly(peer.split);
+    clearPeerCrypto(peer);
     peer = Peer{};
   }
 
@@ -1003,7 +1245,71 @@ private:
   void sendReliableOrdered(Peer &peer,
                            const uint8_t *payload,
                            size_t length) {
-    sendFrameSet(peer, 3, payload, length, true);
+    constexpr size_t MAX_FRAME_PAYLOAD = 1050;
+    if (length <= MAX_FRAME_PAYLOAD) {
+      sendFrameSet(peer, 3, payload, length, true);
+      return;
+    }
+
+    const size_t splitCount =
+      (length + MAX_FRAME_PAYLOAD - 1) / MAX_FRAME_PAYLOAD;
+
+    if (splitCount > RAKNET_MAX_SPLITS) {
+      Serial.printf("[RAKNET] Outbound payload too large: %u frames.\n",
+                    (unsigned)splitCount);
+      return;
+    }
+
+    const uint16_t splitId = peer.nextSplitId++;
+    for (size_t index = 0; index < splitCount; ++index) {
+      const size_t payloadOffset = index * MAX_FRAME_PAYLOAD;
+      const size_t chunk =
+        (length - payloadOffset > MAX_FRAME_PAYLOAD)
+          ? MAX_FRAME_PAYLOAD
+          : (length - payloadOffset);
+
+      uint8_t frame[1200];
+      size_t frameOffset = 0;
+      const uint32_t datagramSequence = peer.nextDatagramSequence++;
+
+      frame[frameOffset++] = 0x80;
+      writeTriadLE(frame + frameOffset, datagramSequence);
+      frameOffset += 3;
+
+      frame[frameOffset++] = (uint8_t)((3U << 5) | 0x10U);
+      writeU16BE(frame + frameOffset, (uint16_t)(chunk * 8U));
+      frameOffset += 2;
+
+      writeTriadLE(frame + frameOffset, peer.nextReliableIndex++);
+      frameOffset += 3;
+      writeTriadLE(frame + frameOffset, peer.nextOrderedIndex);
+      frameOffset += 3;
+      frame[frameOffset++] = 0;
+
+      writeU32LE(frame + frameOffset, (uint32_t)splitCount);
+      frameOffset += 4;
+      writeU16LE(frame + frameOffset, splitId);
+      frameOffset += 2;
+      writeU32LE(frame + frameOffset, (uint32_t)index);
+      frameOffset += 4;
+
+      memcpy(frame + frameOffset, payload + payloadOffset, chunk);
+      frameOffset += chunk;
+
+      sendPacket(frame, frameOffset, peer.ip, peer.port);
+
+      const uint8_t slot = datagramSequence % RAKNET_RELIABLE_CACHE;
+      ReliableCache &cache = peer.reliable[slot];
+      cache.active = true;
+      cache.datagramSequence = datagramSequence;
+      cache.length = (uint16_t)frameOffset;
+      cache.lastSent = millis();
+      memcpy(cache.data, frame, frameOffset);
+
+      reliableSentCount++;
+    }
+
+    peer.nextOrderedIndex++;
   }
 
   void retransmit(Peer &peer, uint32_t sequence) {
@@ -1153,42 +1459,41 @@ private:
 
     size_t offset = 0;
     uint32_t packetId = 0;
-
-    if (!BedrockProtocol::readVarUInt(
-          data, length, offset, packetId)) {
-      return;
-    }
+    if (!BedrockProtocol::readVarUInt(data, length, offset, packetId)) return;
 
     if (packetId == BEDROCK_REQUEST_NETWORK_SETTINGS_ID) {
       if (offset + 4 != length) return;
-
-      const uint32_t clientProtocol =
-        readU32BE(data + offset);
-
-      Serial.printf(
-        "[BEDROCK] RequestNetworkSettings version=%lu\n",
-        (unsigned long)clientProtocol
-      );
-
+      const uint32_t clientProtocol = readU32BE(data + offset);
+      Serial.printf("[BEDROCK] RequestNetworkSettings version=%lu\n",
+                    (unsigned long)clientProtocol);
       if (clientProtocol != BEDROCK_PROTOCOL_VERSION) {
-        Serial.printf(
-          "[BEDROCK] Client version differs. expected=%u\n",
-          BEDROCK_PROTOCOL_VERSION
-        );
+        Serial.printf("[BEDROCK] Client version differs. expected=%u\n",
+                      BEDROCK_PROTOCOL_VERSION);
       }
-
       sendNetworkSettings(peer);
-      return;
-    }
-
-    if (packetId == BEDROCK_GAME_PACKET_ID) {
-      // A 0xFE batch is represented by the wrapper byte, so it is handled
-      // before this point. This branch is kept for defensive diagnostics.
       return;
     }
 
     if (packetId == 1) {
       handleLoginPacket(peer, data + offset, length - offset);
+      return;
+    }
+
+    if (packetId == BEDROCK_CLIENT_TO_SERVER_HANDSHAKE_ID) {
+      Serial.println("[BEDROCK] ClientToServerHandshake received.");
+      if (!peer.encryptionReady) return;
+      sendPlayStatus(peer, 0);
+      if (!peer.resourcePacksInfoSent) sendResourcePacksInfo(peer);
+      return;
+    }
+
+    if (packetId == BEDROCK_RESOURCE_PACK_CLIENT_RESPONSE_ID) {
+      handleResourcePackClientResponse(peer, data + offset, length - offset);
+      return;
+    }
+
+    if (packetId == 175) {
+      handleSubChunkRequest(peer, data + offset, length - offset);
       return;
     }
   }
@@ -1242,19 +1547,6 @@ private:
                          size_t length) {
     loginPacketsCount++;
 
-    // Stable 1.26.51 / protocol 2193 LoginPacket:
-    //   packet id = 1 (already consumed)
-    //   Client Network Version: big-endian int32
-    //   Connection Request: string (varuint32 length)
-    //
-    // The connection-request string contains:
-    //   uint32 LE auth-jwt length
-    //   auth JWT JSON
-    //   uint32 LE client-jwt length
-    //   client JWT
-    //
-    // This matches the current Bedrock login serializers used by established
-    // protocol implementations while keeping the ESP32 parser allocation-free.
     if (length < 4) {
       Serial.println("[BEDROCK] Login packet too short.");
       return;
@@ -1262,7 +1554,6 @@ private:
 
     const uint32_t clientProtocol = readU32BE(data);
     size_t offset = 4;
-
     size_t connectionOffset = 0;
     uint32_t connectionLength = 0;
 
@@ -1272,44 +1563,22 @@ private:
       return;
     }
 
-    if (offset != length) {
-      Serial.printf(
-        "[BEDROCK] Login has %u trailing bytes after connection request.\n",
-        (unsigned)(length - offset)
-      );
-    }
-
-    const uint8_t *connection =
-      data + connectionOffset;
-    const size_t connectionBytes =
-      connectionLength;
-
+    const uint8_t *connection = data + connectionOffset;
+    const size_t connectionBytes = connectionLength;
     size_t innerOffset = 0;
     size_t authOffset = 0;
     uint32_t authLength = 0;
-
-    if (!readLEStringSpan(
-          connection, connectionBytes,
-          innerOffset, authOffset, authLength)) {
-      Serial.println("[BEDROCK] Login auth JWT field is malformed.");
-      return;
-    }
-
     size_t clientJwtOffset = 0;
     uint32_t clientJwtLength = 0;
 
     if (!readLEStringSpan(
           connection, connectionBytes,
+          innerOffset, authOffset, authLength) ||
+        !readLEStringSpan(
+          connection, connectionBytes,
           innerOffset, clientJwtOffset, clientJwtLength)) {
-      Serial.println("[BEDROCK] Login client JWT field is malformed.");
+      Serial.println("[BEDROCK] Login JWT fields are malformed.");
       return;
-    }
-
-    if (innerOffset != connectionBytes) {
-      Serial.printf(
-        "[BEDROCK] Login connection request has %u trailing bytes.\n",
-        (unsigned)(connectionBytes - innerOffset)
-      );
     }
 
     peer.loginReceived = true;
@@ -1317,71 +1586,206 @@ private:
     peer.loginAuthBytes = authLength;
     peer.loginClientJwtBytes = clientJwtLength;
 
-    if (clientProtocol == BEDROCK_PROTOCOL_VERSION) {
-      loginVersionMatchesCount++;
+    if (clientProtocol == BEDROCK_PROTOCOL_VERSION) loginVersionMatchesCount++;
+
+    Serial.printf("[BEDROCK] Login protocol=%lu auth=%lu clientJwt=%lu\n",
+                  (unsigned long)clientProtocol,
+                  (unsigned long)authLength,
+                  (unsigned long)clientJwtLength);
+
+    uint8_t clientPublicKeyDer[256] = {};
+    size_t clientPublicKeyLength = 0;
+    String keySource;
+
+    if (!findClientPublicKey(
+          connection + authOffset,
+          authLength,
+          connection + clientJwtOffset,
+          clientJwtLength,
+          clientPublicKeyDer,
+          sizeof(clientPublicKeyDer),
+          clientPublicKeyLength,
+          keySource)) {
+      Serial.println("[CRYPTO] No client P-384 public key found in Login.");
+      return;
     }
 
-    Serial.printf(
-      "[BEDROCK] Login protocol=%lu auth=%lu bytes clientJwt=%lu bytes%s\n",
-      (unsigned long)clientProtocol,
-      (unsigned long)authLength,
-      (unsigned long)clientJwtLength,
-      clientProtocol == BEDROCK_PROTOCOL_VERSION
-        ? " (version match)"
-        : " (version differs)"
-    );
+    esp_fill_random(peer.encryptionSalt, sizeof(peer.encryptionSalt));
 
-    // Keep the exact JWT byte ranges available for the next stage without
-    // copying the roughly-100KB Login packet into heap memory.
-    (void)authOffset;
-    (void)clientJwtOffset;
+    if (!derivePeerKey(
+          peer, clientPublicKeyDer, clientPublicKeyLength)) {
+      Serial.println("[CRYPTO] ECDH/AES setup failed.");
+      return;
+    }
+
+    String handshakeJwt;
+    if (!createHandshakeJwt(
+          peer.encryptionSalt,
+          sizeof(peer.encryptionSalt),
+          handshakeJwt)) {
+      clearPeerCrypto(peer);
+      peer.encryptionReady = false;
+      Serial.println("[CRYPTO] ServerToClientHandshake JWT creation failed.");
+      return;
+    }
+
+    uint8_t packet[768] = {};
+    size_t packetOffset = 0;
+    const size_t idLength =
+      BedrockProtocol::writeVarUInt(
+        BEDROCK_SERVER_TO_CLIENT_HANDSHAKE_ID,
+        packet, sizeof(packet));
+    if (idLength == 0) return;
+    packetOffset += idLength;
+
+    size_t stringWritten = 0;
+    if (!BedrockProtocol::writeString(
+          handshakeJwt,
+          packet + packetOffset,
+          sizeof(packet) - packetOffset,
+          stringWritten)) return;
+
+    packetOffset += stringWritten;
+    peer.handshakeSent = sendRawBedrockPacket(peer, packet, packetOffset);
+
+    Serial.printf(
+      "[CRYPTO] Session key ready from %s; handshake sent=%s\n",
+      keySource.c_str(),
+      peer.handshakeSent ? "yes" : "no");
+  }
+
+  void handleResourcePackClientResponse(Peer &peer,
+                                        const uint8_t *data,
+                                        size_t length) {
+    size_t offset = 0;
+    uint32_t statusOrdinal = 0;
+    if (!BedrockProtocol::readVarUInt(data, length, offset, statusOrdinal)) return;
+
+    size_t typeOffset = 0;
+    uint32_t typeLength = 0;
+    if (!readVarStringSpan(data, length, offset, typeOffset, typeLength)) return;
+
+    String response;
+    for (uint32_t i = 0; i < typeLength; ++i) {
+      char ch = (char)data[typeOffset + i];
+      if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+      response += ch;
+    }
+
+    resourcePackResponsesCount++;
+    Serial.printf("[BEDROCK] ResourcePackClientResponse status=%lu type=%s\n",
+                  (unsigned long)statusOrdinal, response.c_str());
+
+    if ((response == "downloadingfinished" || response == "haveallpacks") &&
+        !peer.resourcePackStackSent) {
+      sendResourcePackStack(peer);
+      return;
+    }
+
+    if ((response == "resourcepackstackfinished" || response == "completed") &&
+        peer.resourcePackStackSent && !peer.startGameSent) {
+      if (sendStartGame(peer)) {
+        sendPlayStatus(peer, 3);
+        peer.playerSpawnSent = true;
+      }
+    }
+  }
+
+  void handleSubChunkRequest(Peer &peer,
+                             const uint8_t *data,
+                             size_t length) {
+    size_t offset = 0;
+    uint32_t dimension = 0;
+    if (!BedrockProtocol::readVarUInt(data, length, offset, dimension)) return;
+
+    uint32_t requestCount = 0;
+    if (!BedrockProtocol::readVarUInt(data, length, offset, requestCount)) return;
+    if (requestCount > 256) return;
+    if (offset + (size_t)requestCount * 3 + 12 > length) return;
+
+    const size_t offsetsStart = offset;
+    offset += (size_t)requestCount * 3;
+
+    const int32_t centerX = (int32_t)readU32LE(data + offset);
+    const int32_t centerY = (int32_t)readU32LE(data + offset + 4);
+    const int32_t centerZ = (int32_t)readU32LE(data + offset + 8);
+    (void)dimension;
+    (void)centerY;
+
+    uint8_t packet[8192] = {};
+    size_t out = 0;
+    const size_t idLength =
+      BedrockProtocol::writeVarUInt(174, packet + out, sizeof(packet) - out);
+    if (idLength == 0) return;
+    out += idLength;
+
+    packet[out++] = 0; // cache enabled
+    if (out + 1 + 12 + 5 > sizeof(packet)) return;
+    packet[out++] = 0; // dimension 0
+    writeU32LE(packet + out, (uint32_t)centerX); out += 4;
+    writeU32LE(packet + out, (uint32_t)centerY); out += 4;
+    writeU32LE(packet + out, (uint32_t)centerZ); out += 4;
+
+    packet[out++] = (uint8_t)requestCount;
+
+    for (uint32_t i = 0; i < requestCount; ++i) {
+      const uint8_t *requestOffset = data + offsetsStart + i * 3;
+      packet[out++] = requestOffset[0];
+      packet[out++] = requestOffset[1];
+      packet[out++] = requestOffset[2];
+      packet[out++] = 6; // SUCCESS_ALL_AIR
+      packet[out++] = 0; // optional subchunk data absent
+      packet[out++] = 0; // HeightMapDataType.NO_DATA
+      packet[out++] = 0; // optional height map absent
+      packet[out++] = 0; // Render height map type NO_DATA
+      packet[out++] = 0; // optional render height map absent
+      packet[out++] = 0; // optional blob id absent
+      if (out + 10 > sizeof(packet)) break;
+    }
+
+    sendEncryptedBedrockPacket(peer, packet, out);
   }
 
   void handleGameBatch(Peer &peer,
                        const uint8_t *data,
                        size_t length) {
-    if (length < 2 || data[0] != BEDROCK_GAME_PACKET_ID) return;
+    if (!peer.encryptionReady || length < 10 || data[0] != BEDROCK_GAME_PACKET_ID) return;
 
-    size_t offset = 1;
+    const size_t encryptedLength = length - 1;
+    uint8_t *plaintext = (uint8_t *)malloc(encryptedLength);
+    if (!plaintext) return;
 
-    // After NetworkSettings, Bedrock uses a one-byte compression method.
-    // 0xFF means no compression.
-    if (peer.networkSettingsSent) {
-      if (offset >= length) return;
-
-      const uint8_t compressionMethod = data[offset++];
-
-      if (compressionMethod != BEDROCK_BATCH_NONE) {
-        Serial.printf(
-          "[BEDROCK] Unsupported compression method 0x%02X; dropping batch.\n",
-          compressionMethod
-        );
-        return;
-      }
+    memcpy(plaintext, data + 1, encryptedLength);
+    if (!decryptBytes(peer, plaintext, encryptedLength) || encryptedLength < 9) {
+      free(plaintext);
+      return;
     }
 
-    uint32_t packetLength = 0;
+    const size_t bodyLength = encryptedLength - 8;
+    if (!validateEncryptionTrailer(
+          peer, plaintext, bodyLength, plaintext + bodyLength)) {
+      free(plaintext);
+      return;
+    }
 
-    while (offset < length) {
-      size_t lengthOffset = offset;
+    size_t offset = 0;
+    if (plaintext[offset++] != BEDROCK_BATCH_NONE) {
+      free(plaintext);
+      return;
+    }
 
+    while (offset < bodyLength) {
+      uint32_t packetLength = 0;
       if (!BedrockProtocol::readVarUInt(
-            data, length, offset, packetLength)) {
-        return;
-      }
-
-      if (packetLength == 0 ||
-          packetLength > 64 * 1024 ||
-          offset + packetLength > length) {
-        return;
-      }
-
-      handleBedrockPayload(peer, data + offset, packetLength);
-
+            plaintext, bodyLength, offset, packetLength)) break;
+      if (packetLength == 0 || packetLength > 64 * 1024 ||
+          offset + packetLength > bodyLength) break;
+      handleBedrockPayload(peer, plaintext + offset, packetLength);
       offset += packetLength;
-
-      if (offset == lengthOffset) return;
     }
+
+    encryptedPacketsReceivedCount++;
+    free(plaintext);
   }
 
   void handleConnectedDatagram(const uint8_t *data,
@@ -1866,7 +2270,18 @@ private:
                   (unsigned long)network->pingsAnswered());
     Serial.printf("  Handshake steps: %lu\n",
                   (unsigned long)network->handshakeSteps());
-    Serial.println("  Reliable session layer: next stage");
+    Serial.printf("  Encrypted packets sent: %lu
+",
+                  (unsigned long)network->encryptedPacketsSent());
+    Serial.printf("  Encrypted packets received: %lu
+",
+                  (unsigned long)network->encryptedPacketsReceived());
+    Serial.printf("  Resource-pack responses: %lu
+",
+                  (unsigned long)network->resourcePackResponses());
+    Serial.printf("  StartGame packets sent: %lu
+",
+                  (unsigned long)network->startGamePacketsSent());
   }
 
   void cmdStatus() {
@@ -1962,7 +2377,7 @@ bool mountStorage() {
 void printBootInfo() {
   Serial.println();
   Serial.println("======================================");
-  Serial.println("          ESP-BEDROCK 0.5.1");
+  Serial.println("          ESP-BEDROCK 0.6.0");
   Serial.println("======================================");
   Serial.println("Target: ESP32-WROVER-E");
   Serial.printf("Chip cores: %d\n", ESP.getChipCores());
@@ -1992,6 +2407,7 @@ void setup() {
 
   wifiManager.begin();
 
+  network.attachWorld(world);
   terminal.begin(world, network);
 
   // The server only binds its UDP socket after a normal Wi-Fi connection.
