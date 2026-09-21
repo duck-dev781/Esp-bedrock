@@ -762,8 +762,12 @@ private:
       return;
     }
 
+    size_t discoveredMtuValue = length + 28U;
+    if (discoveredMtuValue > (size_t)RAKNET_MAX_MTU) {
+      discoveredMtuValue = RAKNET_MAX_MTU;
+    }
     const uint16_t discoveredMtu =
-      (uint16_t)min((size_t)RAKNET_MAX_MTU, length + 28U);
+      (uint16_t)discoveredMtuValue;
 
     uint8_t response[32];
     size_t offset = 0;
