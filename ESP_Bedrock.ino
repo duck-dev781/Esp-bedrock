@@ -88,6 +88,20 @@ struct PlayerState {
   uint16_t hunger = 20;
 };
 
+static const uint8_t RAKNET_RAKNET_MAGIC[16] = {
+  0x00, 0xFF, 0xFF, 0x00,
+  0xFE, 0xFE, 0xFE, 0xFE,
+  0xFD, 0xFD, 0xFD, 0xFD,
+  0x12, 0x34, 0x56, 0x78
+};
+
+static String u64ToDecimal(uint64_t value) {
+  char buffer[24];
+  snprintf(buffer, sizeof(buffer), "%llu",
+           (unsigned long long)value);
+  return String(buffer);
+}
+
 class WiFiManager {
 public:
   void begin() {
@@ -497,13 +511,6 @@ public:
   uint64_t guid() const { return serverGuid; }
 
 private:
-  static constexpr uint8_t MAGIC[16] = {
-    0x00, 0xFF, 0xFF, 0x00,
-    0xFE, 0xFE, 0xFE, 0xFE,
-    0xFD, 0xFD, 0xFD, 0xFD,
-    0x12, 0x34, 0x56, 0x78
-  };
-
   WiFiUDP udp;
   bool serverRunning = false;
   uint64_t serverGuid = 0;
@@ -512,6 +519,7 @@ private:
   uint32_t pingsAnsweredCount = 0;
   uint32_t handshakeCount = 0;
   uint32_t connectedDatagramCount = 0;
+  uint32_t outgoingSequence = 0;
 
   Peer peers[ESPBEDROCK_MAX_PLAYERS];
 
@@ -552,7 +560,7 @@ private:
   }
 
   static bool magicOK(const uint8_t *data, size_t offset, size_t length) {
-    return offset + 16 <= length && memcmp(data + offset, MAGIC, 16) == 0;
+    return offset + 16 <= length && memcmp(data + offset, RAKNET_MAGIC, 16) == 0;
   }
 
   static void writeRakAddress(uint8_t *out,
@@ -628,7 +636,7 @@ private:
       String(BEDROCK_VERSION_NAME) + ";" +
       String(activePeers()) + ";" +
       String(ESPBEDROCK_MAX_PLAYERS) + ";" +
-      String((unsigned long long)serverGuid) + ";" +
+      u64ToDecimal(serverGuid) + ";" +
       String(BEDROCK_LEVEL_NAME) + ";Survival;1;" +
       String(ESPBEDROCK_UDP_PORT) + ";19133;";
 
@@ -642,8 +650,8 @@ private:
     writeU64BE(response + offset, serverGuid);
     offset += 8;
 
-    memcpy(response + offset, MAGIC, sizeof(MAGIC));
-    offset += sizeof(MAGIC);
+    memcpy(response + offset, RAKNET_MAGIC, sizeof(RAKNET_MAGIC));
+    offset += sizeof(RAKNET_MAGIC);
 
     const uint16_t motdLength = (uint16_t)motd.length();
     writeU16BE(response + offset, motdLength);
@@ -660,7 +668,7 @@ private:
     uint8_t response[27];
     response[0] = 0x19;
     response[1] = RAKNET_PROTOCOL_VERSION;
-    memcpy(response + 2, MAGIC, sizeof(MAGIC));
+    memcpy(response + 2, RAKNET_MAGIC, sizeof(RAKNET_MAGIC));
     writeU64BE(response + 18, serverGuid);
     sendPacket(response, sizeof(response), ip, port);
   }
@@ -690,8 +698,8 @@ private:
     uint8_t response[64];
     size_t offset = 0;
     response[offset++] = 0x06;
-    memcpy(response + offset, MAGIC, sizeof(MAGIC));
-    offset += sizeof(MAGIC);
+    memcpy(response + offset, RAKNET_MAGIC, sizeof(RAKNET_MAGIC));
+    offset += sizeof(RAKNET_MAGIC);
     writeU64BE(response + offset, serverGuid);
     offset += 8;
     response[offset++] = 0;
@@ -732,8 +740,8 @@ private:
     size_t offset = 0;
 
     response[offset++] = 0x08;
-    memcpy(response + offset, MAGIC, sizeof(MAGIC));
-    offset += sizeof(MAGIC);
+    memcpy(response + offset, RAKNET_MAGIC, sizeof(RAKNET_MAGIC));
+    offset += sizeof(RAKNET_MAGIC);
     writeU64BE(response + offset, serverGuid);
     offset += 8;
 
@@ -854,7 +862,7 @@ private:
     size_t offset = 0;
 
     response[offset++] = 0x80;
-    writeTriadLE(response + offset, 0);
+    writeTriadLE(response + offset, outgoingSequence++ & 0xFFFFFFUL);
     offset += 3;
 
     response[offset++] = 0x00;
@@ -938,6 +946,9 @@ private:
     else if (command == "lan") {
       wifiManager.printLanInfo();
     }
+    else if (command == "raknet") {
+      cmdRakNet();
+    }
     else if (command == "sd status") {
       cmdSDStatus();
     }
@@ -994,6 +1005,7 @@ private:
     Serial.println("  lan");
     Serial.println("  sd status");
     Serial.println("  sd ls");
+    Serial.println("  raknet");
     Serial.println("  stop");
   }
 
@@ -1061,6 +1073,25 @@ private:
     }
 
     root.close();
+  }
+
+  void cmdRakNet() {
+    Serial.println("[RAKNET] Direct-server transport");
+    Serial.printf("  UDP port: %u\n", ESPBEDROCK_UDP_PORT);
+    Serial.printf("  RakNet protocol: %u\n", RAKNET_PROTOCOL_VERSION);
+    Serial.printf("  Bedrock protocol: %u (%s)\n",
+                  BEDROCK_PROTOCOL_VERSION,
+                  BEDROCK_VERSION_NAME);
+    Serial.printf("  Active peers: %u/%u\n",
+                  (unsigned)network->activePeers(),
+                  (unsigned)ESPBEDROCK_MAX_PLAYERS);
+    Serial.printf("  Server GUID: %s\n",
+                  u64ToDecimal(network->guid()).c_str());
+    Serial.printf("  Pongs answered: %lu\n",
+                  (unsigned long)network->pingsAnswered());
+    Serial.printf("  Handshake steps: %lu\n",
+                  (unsigned long)network->handshakeSteps());
+    Serial.println("  Reliable session layer: next stage");
   }
 
   void cmdStatus() {
