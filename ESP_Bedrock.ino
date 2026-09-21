@@ -11,6 +11,7 @@
 
   Current features:
     - ESP32-WROVER-E / PSRAM awareness
+    - FNK0047-compatible SDMMC 1-bit storage
     - Wi-Fi STA/client mode (no SoftAP)
     - Serial Wi-Fi configuration with saved credentials
     - UDP port 19132 foundation
@@ -49,17 +50,20 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <SPI.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <FS.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
 
-#define ESPBEDROCK_VERSION       "0.2.0"
+#define ESPBEDROCK_VERSION       "0.3.0"
 #define ESPBEDROCK_UDP_PORT      19132
 #define ESPBEDROCK_HOSTNAME       "esp-bedrock"
 #define ESPBEDROCK_MAX_PLAYERS   4
-#define SD_CS_PIN                5
+#define SD_MMC_CMD               15  // FNK0047/Freenove fixed pin
+#define SD_MMC_CLK               14  // FNK0047/Freenove fixed pin
+#define SD_MMC_D0                 2  // FNK0047/Freenove fixed pin
+#define SD_MMC_MOUNT_POINT       "/sdcard"
+#define SD_MMC_MAX_FILES          5
 #define ESPBEDROCK_WORLD_DIR     "/espbedrock/world"
 #define ESPBEDROCK_CONFIG_DIR    "/espbedrock/config"
 #define ESPBEDROCK_ASSET_DIR     "/espbedrock/assets"
@@ -586,8 +590,8 @@ private:
     Serial.printf("UDP packets received: %lu\n",
                   (unsigned long)network->packetsReceived());
     Serial.printf("UDP port: %u\n", ESPBEDROCK_UDP_PORT);
-    Serial.printf("SD: %s\n",
-                  SD.cardType() == CARD_NONE ? "not mounted" : "mounted");
+    Serial.printf("SDMMC: %s\n",
+                  SD_MMC.cardType() == CARD_NONE ? "not mounted" : "mounted");
   }
 
   void cmdWorld() {
@@ -602,23 +606,74 @@ NetworkServer network;
 SerialTerminal terminal;
 
 bool mountStorage() {
-  if (!SD.begin(SD_CS_PIN)) {
-    Serial.println("[SD] Mount failed. Server will run without persistence.");
+  // Freenove FNK0047 / ESP32-WROVER uses the built-in SDMMC slot.
+  // Freenove documents the 1-bit bus as:
+  //   CLK = GPIO14
+  //   CMD = GPIO15
+  //   D0  = GPIO2
+  // They specifically use the 1-bit SDMMC configuration.
+  SD_MMC.setPins(SD_MMC_CLK, SD_MMC_CMD, SD_MMC_D0);
+
+  if (!SD_MMC.begin(
+        SD_MMC_MOUNT_POINT,
+        true,                   // format if mount fails
+        true,                   // 1-bit mode
+        SDMMC_FREQ_DEFAULT,     // Freenove's documented setting
+        SD_MMC_MAX_FILES)) {
+    Serial.println("[SD] SDMMC mount failed.");
     return false;
   }
 
-  Serial.println("[SD] Mounted.");
-  SD.mkdir("/espbedrock");
-  SD.mkdir(ESPBEDROCK_WORLD_DIR);
-  SD.mkdir(ESPBEDROCK_CONFIG_DIR);
-  SD.mkdir(ESPBEDROCK_ASSET_DIR);
+  const uint8_t cardType = SD_MMC.cardType();
+
+  if (cardType == CARD_NONE) {
+    Serial.println("[SD] No SDMMC card detected.");
+    SD_MMC.end();
+    return false;
+  }
+
+  Serial.print("[SD] Card type: ");
+
+  if (cardType == CARD_MMC) {
+    Serial.println("MMC");
+  }
+  else if (cardType == CARD_SD) {
+    Serial.println("SDSC");
+  }
+  else if (cardType == CARD_SDHC) {
+    Serial.println("SDHC");
+  }
+  else {
+    Serial.println("UNKNOWN");
+  }
+
+  Serial.printf(
+    "[SD] Capacity: %llu MB\\n",
+    SD_MMC.cardSize() / (1024ULL * 1024ULL)
+  );
+
+  Serial.printf(
+    "[SD] Total: %llu MB\\n",
+    SD_MMC.totalBytes() / (1024ULL * 1024ULL)
+  );
+
+  Serial.printf(
+    "[SD] Used: %llu MB\\n",
+    SD_MMC.usedBytes() / (1024ULL * 1024ULL)
+  );
+
+  SD_MMC.mkdir("/espbedrock");
+  SD_MMC.mkdir(ESPBEDROCK_WORLD_DIR);
+  SD_MMC.mkdir(ESPBEDROCK_CONFIG_DIR);
+  SD_MMC.mkdir(ESPBEDROCK_ASSET_DIR);
+
   return true;
 }
 
 void printBootInfo() {
   Serial.println();
   Serial.println("======================================");
-  Serial.println("          ESP-BEDROCK 0.2.0");
+  Serial.println("          ESP-BEDROCK 0.3.0");
   Serial.println("======================================");
   Serial.println("Target: ESP32-WROVER-E");
   Serial.printf("Chip cores: %d\n", ESP.getChipCores());
@@ -639,7 +694,7 @@ void setup() {
   const bool sdReady = mountStorage();
 
   if (sdReady) {
-    if (!world.begin(SD)) {
+    if (!world.begin(SD_MMC)) {
       Serial.println("[WORLD] World initialization failed.");
     }
   } else {
