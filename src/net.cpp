@@ -1,5 +1,6 @@
 #include "net.h"
 #include "espbedrock_config.h"
+#include "bedrock_protocol.h"
 
 bool NetworkServer::begin() {
   return udp.begin(ESPBEDROCK_UDP_PORT) == 1;
@@ -13,10 +14,18 @@ void NetworkServer::handlePacket(const uint8_t *data, size_t len, IPAddress from
                 from.toString().c_str(),
                 (unsigned)port);
 
-  // Protocol work starts here. We deliberately do not pretend that a
-  // raw UDP socket is already a Bedrock/RakNet implementation.
-  // The next protocol layer will parse RakNet framing and Bedrock packets.
-  (void)data;
+  // This is intentionally only the protocol entry point for now.
+  // A future layer will recognize RakNet datagrams, perform the connection
+  // handshake, then hand Bedrock payloads to the session manager.
+  if (len > 0) {
+    size_t offset = 0;
+    uint32_t firstVarUInt = 0;
+
+    if (BedrockProtocol::readVarUInt(data, len, offset, firstVarUInt)) {
+      Serial.printf("[PROTO] first varuint=0x%08lX\n",
+                    (unsigned long)firstVarUInt);
+    }
+  }
 }
 
 void NetworkServer::update() {
