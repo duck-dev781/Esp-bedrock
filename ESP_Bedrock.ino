@@ -55,10 +55,15 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 
-#define ESPBEDROCK_VERSION       "0.3.1"
+#define ESPBEDROCK_VERSION       "0.4.0"
 #define ESPBEDROCK_UDP_PORT      19132
 #define ESPBEDROCK_HOSTNAME       "esp-bedrock"
 #define ESPBEDROCK_MAX_PLAYERS   4
+#define RAKNET_PROTOCOL_VERSION  11
+#define RAKNET_MAX_MTU           1492
+#define BEDROCK_PROTOCOL_VERSION 2193
+#define BEDROCK_VERSION_NAME     "1.26.51"
+#define BEDROCK_LEVEL_NAME       "ESP World"
 #define SD_MMC_CMD               15  // FNK0047/Freenove fixed pin
 #define SD_MMC_CLK               14  // FNK0047/Freenove fixed pin
 #define SD_MMC_D0                 2  // FNK0047/Freenove fixed pin
@@ -394,9 +399,20 @@ private:
 
 class NetworkServer {
 public:
+  struct Peer {
+    bool active = false;
+    bool openConnection = false;
+    uint64_t clientGuid = 0;
+    IPAddress ip;
+    uint16_t port = 0;
+    uint16_t mtu = 1200;
+    uint32_t lastSeen = 0;
+    uint32_t datagramsReceived = 0;
+  };
+
   bool begin() {
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[NET] Wi-Fi is not connected. UDP server not started.");
+      Serial.println("[NET] Wi-Fi is not connected. RakNet listener not started.");
       serverRunning = false;
       return false;
     }
@@ -404,8 +420,10 @@ public:
     serverRunning = udp.begin(ESPBEDROCK_UDP_PORT) == 1;
 
     if (serverRunning) {
-      Serial.printf("[NET] UDP listener active on %u\n",
-                    ESPBEDROCK_UDP_PORT);
+      serverGuid = ESP.getEfuseMac();
+      Serial.printf("[RAKNET] Listening on UDP %u\\n", ESPBEDROCK_UDP_PORT);
+      Serial.printf("[RAKNET] Server GUID: %llu\\n", (unsigned long long)serverGuid);
+      Serial.printf("[RAKNET] Protocol: %u\\n", RAKNET_PROTOCOL_VERSION);
     }
 
     return serverRunning;
@@ -415,13 +433,15 @@ public:
     if (serverRunning && WiFi.status() != WL_CONNECTED) {
       udp.stop();
       serverRunning = false;
-      Serial.println("[NET] Wi-Fi lost; UDP server stopped.");
+      Serial.println("[RAKNET] Wi-Fi lost; listener stopped.");
       return;
     }
 
     if (!serverRunning && WiFi.status() == WL_CONNECTED) {
       begin();
     }
+
+    cleanupPeers();
   }
 
   void update() {
@@ -430,34 +450,423 @@ public:
     const int packetSize = udp.parsePacket();
     if (packetSize <= 0) return;
 
-    uint8_t buffer[512];
+    uint8_t buffer[1536];
     const size_t n = udp.read(buffer, sizeof(buffer));
-    rxPackets++;
+    if (n == 0) return;
 
-    Serial.printf("[UDP] %u bytes from %s:%u\n",
-                  (unsigned)n,
-                  udp.remoteIP().toString().c_str(),
-                  (unsigned)udp.remotePort());
+    const IPAddress from = udp.remoteIP();
+    const uint16_t port = udp.remotePort();
 
-    if (n > 0) {
-      size_t offset = 0;
-      uint32_t firstVarUInt = 0;
+    packetsReceivedCount++;
 
-      if (BedrockProtocol::readVarUInt(buffer, n, offset, firstVarUInt)) {
-        Serial.printf("[PROTO] first varuint=0x%08lX\n",
-                      (unsigned long)firstVarUInt);
+    switch (buffer[0]) {
+      case 0x01:
+      case 0x02:
+        handleUnconnectedPing(buffer, n, from, port);
+        break;
+
+      case 0x05:
+        handleOpenConnectionRequest1(buffer, n, from, port);
+        break;
+
+      case 0x07:
+        handleOpenConnectionRequest2(buffer, n, from, port);
+        break;
+
+      default:
+        if (buffer[0] >= 0x80 && buffer[0] <= 0x8D) {
+          handleConnectedDatagram(buffer, n, from, port);
+        }
+        break;
+    }
+  }
+
+  uint32_t packetsReceived() const { return packetsReceivedCount; }
+  uint32_t pingsAnswered() const { return pingsAnsweredCount; }
+  uint32_t handshakeSteps() const { return handshakeCount; }
+  uint32_t connectedDatagrams() const { return connectedDatagramCount; }
+
+  uint8_t activePeers() const {
+    uint8_t count = 0;
+    for (const auto &peer : peers) {
+      if (peer.active) count++;
+    }
+    return count;
+  }
+
+  uint64_t guid() const { return serverGuid; }
+
+private:
+  static constexpr uint8_t MAGIC[16] = {
+    0x00, 0xFF, 0xFF, 0x00,
+    0xFE, 0xFE, 0xFE, 0xFE,
+    0xFD, 0xFD, 0xFD, 0xFD,
+    0x12, 0x34, 0x56, 0x78
+  };
+
+  WiFiUDP udp;
+  bool serverRunning = false;
+  uint64_t serverGuid = 0;
+
+  uint32_t packetsReceivedCount = 0;
+  uint32_t pingsAnsweredCount = 0;
+  uint32_t handshakeCount = 0;
+  uint32_t connectedDatagramCount = 0;
+
+  Peer peers[ESPBEDROCK_MAX_PLAYERS];
+
+  static void writeU16BE(uint8_t *out, uint16_t value) {
+    out[0] = (uint8_t)(value >> 8);
+    out[1] = (uint8_t)value;
+  }
+
+  static uint16_t readU16BE(const uint8_t *in) {
+    return ((uint16_t)in[0] << 8) | in[1];
+  }
+
+  static void writeU64BE(uint8_t *out, uint64_t value) {
+    for (int i = 7; i >= 0; --i) {
+      out[i] = (uint8_t)(value & 0xFF);
+      value >>= 8;
+    }
+  }
+
+  static uint64_t readU64BE(const uint8_t *in) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+      value = (value << 8) | in[i];
+    }
+    return value;
+  }
+
+  static uint32_t readTriadLE(const uint8_t *in) {
+    return ((uint32_t)in[0]) |
+           ((uint32_t)in[1] << 8) |
+           ((uint32_t)in[2] << 16);
+  }
+
+  static void writeTriadLE(uint8_t *out, uint32_t value) {
+    out[0] = (uint8_t)value;
+    out[1] = (uint8_t)(value >> 8);
+    out[2] = (uint8_t)(value >> 16);
+  }
+
+  static bool magicOK(const uint8_t *data, size_t offset, size_t length) {
+    return offset + 16 <= length && memcmp(data + offset, MAGIC, 16) == 0;
+  }
+
+  static void writeRakAddress(uint8_t *out,
+                              const IPAddress &ip,
+                              uint16_t port) {
+    out[0] = 4;
+    for (uint8_t i = 0; i < 4; ++i) {
+      out[1 + i] = (uint8_t)~ip[i];
+    }
+    writeU16BE(out + 5, port);
+  }
+
+  Peer *findPeer(const IPAddress &ip, uint16_t port, uint64_t guid = 0) {
+    for (auto &peer : peers) {
+      if (!peer.active) continue;
+      if (guid != 0 && peer.clientGuid == guid) return &peer;
+      if (peer.ip == ip && peer.port == port) return &peer;
+    }
+    return nullptr;
+  }
+
+  Peer *allocatePeer(const IPAddress &ip, uint16_t port, uint64_t guid) {
+    Peer *peer = findPeer(ip, port, guid);
+    if (peer) {
+      peer->lastSeen = millis();
+      return peer;
+    }
+
+    for (auto &candidate : peers) {
+      if (!candidate.active) {
+        candidate = Peer{};
+        candidate.active = true;
+        candidate.ip = ip;
+        candidate.port = port;
+        candidate.clientGuid = guid;
+        candidate.lastSeen = millis();
+        return &candidate;
+      }
+    }
+
+    return nullptr;
+  }
+
+  void cleanupPeers() {
+    const uint32_t now = millis();
+    for (auto &peer : peers) {
+      if (peer.active && now - peer.lastSeen > 120000UL) {
+        peer = Peer{};
       }
     }
   }
 
-  uint32_t packetsReceived() const {
-    return rxPackets;
+  void sendPacket(const uint8_t *data,
+                  size_t length,
+                  IPAddress ip,
+                  uint16_t port) {
+    udp.beginPacket(ip, port);
+    udp.write(data, length);
+    udp.endPacket();
   }
 
-private:
-  WiFiUDP udp;
-  bool serverRunning = false;
-  uint32_t rxPackets = 0;
+  void handleUnconnectedPing(const uint8_t *data,
+                             size_t length,
+                             IPAddress ip,
+                             uint16_t port) {
+    if (length < 33 || !magicOK(data, 9, length)) return;
+
+    const uint64_t pingTime = readU64BE(data + 1);
+
+    const String motd =
+      String("MCPE;ESP-Bedrock;") +
+      String(BEDROCK_PROTOCOL_VERSION) + ";" +
+      String(BEDROCK_VERSION_NAME) + ";" +
+      String(activePeers()) + ";" +
+      String(ESPBEDROCK_MAX_PLAYERS) + ";" +
+      String((unsigned long long)serverGuid) + ";" +
+      String(BEDROCK_LEVEL_NAME) + ";Survival;1;" +
+      String(ESPBEDROCK_UDP_PORT) + ";19133;";
+
+    uint8_t response[512];
+    size_t offset = 0;
+    response[offset++] = 0x1C;
+
+    writeU64BE(response + offset, pingTime);
+    offset += 8;
+
+    writeU64BE(response + offset, serverGuid);
+    offset += 8;
+
+    memcpy(response + offset, MAGIC, sizeof(MAGIC));
+    offset += sizeof(MAGIC);
+
+    const uint16_t motdLength = (uint16_t)motd.length();
+    writeU16BE(response + offset, motdLength);
+    offset += 2;
+
+    memcpy(response + offset, motd.c_str(), motdLength);
+    offset += motdLength;
+
+    sendPacket(response, offset, ip, port);
+    pingsAnsweredCount++;
+  }
+
+  void sendIncompatible(IPAddress ip, uint16_t port) {
+    uint8_t response[27];
+    response[0] = 0x19;
+    response[1] = RAKNET_PROTOCOL_VERSION;
+    memcpy(response + 2, MAGIC, sizeof(MAGIC));
+    writeU64BE(response + 18, serverGuid);
+    sendPacket(response, sizeof(response), ip, port);
+  }
+
+  void handleOpenConnectionRequest1(const uint8_t *data,
+                                    size_t length,
+                                    IPAddress ip,
+                                    uint16_t port) {
+    if (length < 18 || !magicOK(data, 1, length)) return;
+
+    const uint8_t clientVersion = data[17];
+
+    if (clientVersion != RAKNET_PROTOCOL_VERSION) {
+      Serial.printf("[RAKNET] Client protocol %u != server %u\\n",
+                    clientVersion, RAKNET_PROTOCOL_VERSION);
+      sendIncompatible(ip, port);
+      return;
+    }
+
+    uint16_t mtu = (uint16_t)min(
+      (uint32_t)RAKNET_MAX_MTU,
+      (uint32_t)length + 28UL
+    );
+
+    if (mtu < 576) mtu = 576;
+
+    uint8_t response[64];
+    size_t offset = 0;
+    response[offset++] = 0x06;
+    memcpy(response + offset, MAGIC, sizeof(MAGIC));
+    offset += sizeof(MAGIC);
+    writeU64BE(response + offset, serverGuid);
+    offset += 8;
+    response[offset++] = 0;
+    writeU16BE(response + offset, mtu);
+    offset += 2;
+
+    sendPacket(response, offset, ip, port);
+    handshakeCount++;
+
+    Serial.printf("[RAKNET] Reply1 -> %s:%u mtu=%u\\n",
+                  ip.toString().c_str(), (unsigned)port, mtu);
+  }
+
+  void handleOpenConnectionRequest2(const uint8_t *data,
+                                    size_t length,
+                                    IPAddress ip,
+                                    uint16_t port) {
+    if (length < 34 || !magicOK(data, 1, length)) return;
+
+    const uint16_t clientMtu = readU16BE(data + 24);
+    const uint64_t clientGuid = readU64BE(data + 26);
+
+    Peer *peer = allocatePeer(ip, port, clientGuid);
+
+    if (!peer) {
+      const uint8_t failed[] = { 0x11 };
+      sendPacket(failed, sizeof(failed), ip, port);
+      Serial.printf("[RAKNET] Connection slots full for %s:%u\\n",
+                    ip.toString().c_str(), (unsigned)port);
+      return;
+    }
+
+    peer->openConnection = true;
+    peer->mtu = min(clientMtu, (uint16_t)RAKNET_MAX_MTU);
+    peer->lastSeen = millis();
+
+    uint8_t response[64];
+    size_t offset = 0;
+
+    response[offset++] = 0x08;
+    memcpy(response + offset, MAGIC, sizeof(MAGIC));
+    offset += sizeof(MAGIC);
+    writeU64BE(response + offset, serverGuid);
+    offset += 8;
+
+    writeRakAddress(response + offset, ip, port);
+    offset += 7;
+
+    writeU16BE(response + offset, peer->mtu);
+    offset += 2;
+
+    response[offset++] = 0;
+
+    sendPacket(response, offset, ip, port);
+    handshakeCount++;
+
+    Serial.printf("[RAKNET] Reply2 -> %s:%u guid=%llu mtu=%u\\n",
+                  ip.toString().c_str(),
+                  (unsigned)port,
+                  (unsigned long long)clientGuid,
+                  peer->mtu);
+  }
+
+  void handleConnectedDatagram(const uint8_t *data,
+                               size_t length,
+                               IPAddress ip,
+                               uint16_t port) {
+    if (length < 4) return;
+
+    Peer *peer = findPeer(ip, port);
+    const uint32_t sequence = readTriadLE(data + 1);
+
+    connectedDatagramCount++;
+
+    if (!peer) {
+      Serial.printf("[RAKNET] Datagram before handshake from %s:%u seq=%lu\\n",
+                    ip.toString().c_str(),
+                    (unsigned)port,
+                    (unsigned long)sequence);
+      return;
+    }
+
+    peer->lastSeen = millis();
+    peer->datagramsReceived++;
+    parseFrames(data + 4, length - 4, peer);
+  }
+
+  void parseFrames(const uint8_t *data, size_t length, Peer *peer) {
+    size_t offset = 0;
+
+    while (offset + 3 <= length) {
+      const uint8_t flags = data[offset++];
+      const uint8_t reliability = (flags >> 5) & 0x07;
+      const bool isSplit = (flags & 0x10) != 0;
+
+      const uint16_t bitLength =
+        ((uint16_t)data[offset] << 8) | data[offset + 1];
+      offset += 2;
+
+      const bool reliable =
+        reliability == 2 ||
+        reliability == 3 ||
+        reliability == 4 ||
+        reliability == 6 ||
+        reliability == 7;
+
+      const bool sequenced = reliability == 1 || reliability == 4;
+      const bool ordered = reliability == 3 || reliability == 4 || reliability == 7;
+
+      if (reliable) {
+        if (offset + 3 > length) return;
+        offset += 3;
+      }
+
+      if (sequenced) {
+        if (offset + 3 > length) return;
+        offset += 3;
+      }
+
+      if (ordered) {
+        if (offset + 4 > length) return;
+        offset += 4;
+      }
+
+      if (isSplit) {
+        if (offset + 10 > length) return;
+        offset += 10;
+      }
+
+      const size_t payloadBytes = (bitLength + 7U) / 8U;
+      if (offset + payloadBytes > length) return;
+
+      if (payloadBytes > 0) {
+        const uint8_t id = data[offset];
+
+        if (id == 0x09 && payloadBytes >= 17) {
+          const uint64_t clientGuid = readU64BE(data + offset + 1);
+          const uint64_t requestTime = readU64BE(data + offset + 9);
+
+          peer->clientGuid = clientGuid;
+
+          Serial.printf("[RAKNET] ConnectionRequest guid=%llu time=%llu\\n",
+                        (unsigned long long)clientGuid,
+                        (unsigned long long)requestTime);
+          Serial.println("[RAKNET] Reliable session response is next layer.");
+        }
+        else if (id == 0x00 && payloadBytes >= 9) {
+          const uint64_t pingTime = readU64BE(data + offset + 1);
+          sendConnectedPong(peer, pingTime);
+          Serial.println("[RAKNET] ConnectedPing -> ConnectedPong");
+        }
+      }
+
+      offset += payloadBytes;
+    }
+  }
+
+  void sendConnectedPong(Peer *peer, uint64_t pingTime) {
+    uint8_t response[32];
+    size_t offset = 0;
+
+    response[offset++] = 0x80;
+    writeTriadLE(response + offset, 0);
+    offset += 3;
+
+    response[offset++] = 0x00;
+    writeU16BE(response + offset, 72);
+    offset += 2;
+
+    response[offset++] = 0x03;
+    writeU64BE(response + offset, pingTime);
+    offset += 8;
+
+    sendPacket(response, offset, peer->ip, peer->port);
+  }
 };
 
 class SerialTerminal {
@@ -747,7 +1156,7 @@ bool mountStorage() {
 void printBootInfo() {
   Serial.println();
   Serial.println("======================================");
-  Serial.println("          ESP-BEDROCK 0.3.1");
+  Serial.println("          ESP-BEDROCK 0.4.0");
   Serial.println("======================================");
   Serial.println("Target: ESP32-WROVER-E");
   Serial.printf("Chip cores: %d\n", ESP.getChipCores());
