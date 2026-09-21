@@ -190,10 +190,38 @@ private:
 class NetworkServer {
 public:
   bool begin() {
-    return udp.begin(ESPBEDROCK_UDP_PORT) == 1;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[NET] Wi-Fi is not connected. UDP server not started.");
+      serverRunning = false;
+      return false;
+    }
+
+    serverRunning = udp.begin(ESPBEDROCK_UDP_PORT) == 1;
+
+    if (serverRunning) {
+      Serial.printf("[NET] UDP listener active on %u\\n",
+                    ESPBEDROCK_UDP_PORT);
+    }
+
+    return serverRunning;
+  }
+
+  void restartIfNeeded() {
+    if (serverRunning && WiFi.status() != WL_CONNECTED) {
+      udp.stop();
+      serverRunning = false;
+      Serial.println("[NET] Wi-Fi lost; UDP server stopped.");
+      return;
+    }
+
+    if (!serverRunning && WiFi.status() == WL_CONNECTED) {
+      begin();
+    }
   }
 
   void update() {
+    if (!serverRunning) return;
+
     const int packetSize = udp.parsePacket();
     if (packetSize <= 0) return;
 
@@ -201,7 +229,7 @@ public:
     const size_t n = udp.read(buffer, sizeof(buffer));
     rxPackets++;
 
-    Serial.printf("[UDP] %u bytes from %s:%u\n",
+    Serial.printf("[UDP] %u bytes from %s:%u\\n",
                   (unsigned)n,
                   udp.remoteIP().toString().c_str(),
                   (unsigned)udp.remotePort());
@@ -209,15 +237,21 @@ public:
     if (n > 0) {
       size_t offset = 0;
       uint32_t firstVarUInt = 0;
+
       if (BedrockProtocol::readVarUInt(buffer, n, offset, firstVarUInt)) {
-        Serial.printf("[PROTO] first varuint=0x%08lX\n",
+        Serial.printf("[PROTO] first varuint=0x%08lX\\n",
                       (unsigned long)firstVarUInt);
       }
     }
   }
 
+  uint32_t packetsReceived() const {
+    return rxPackets;
+  }
+
 private:
   WiFiUDP udp;
+  bool serverRunning = false;
   uint32_t rxPackets = 0;
 };
 
@@ -273,6 +307,23 @@ private:
         Serial.printf("Time set to %ld.\n", t);
       }
     }
+    else if (command == "wifi status") {
+      wifiManager.printStatus();
+    }
+    else if (command == "wifi scan") {
+      wifiManager.scan();
+    }
+    else if (command == "wifi connect") {
+      wifiManager.connect();
+      network->restartIfNeeded();
+    }
+    else if (command == "wifi clear") {
+      wifiManager.clearCredentials();
+      network->restartIfNeeded();
+    }
+    else if (command.startsWith("wifi set ")) {
+      cmdWifiSet(command.substring(9));
+    }
     else if (command == "stop") {
       Serial.println("Saving world before stop...");
       world->save();
@@ -325,7 +376,10 @@ private:
     Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
     Serial.printf("PSRAM total: %u bytes\n", ESP.getPsramSize());
     Serial.printf("PSRAM free: %u bytes\n", ESP.getFreePsram());
-    Serial.printf("WiFi AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+    Serial.println("Wi-Fi mode: STA/client ONLY");
+    wifiManager.printStatus();
+    Serial.printf("UDP packets received: %lu\n",
+                  (unsigned long)network->packetsReceived());
     Serial.printf("UDP port: %u\n", ESPBEDROCK_UDP_PORT);
     Serial.printf("SD: %s\n",
                   SD.cardType() == CARD_NONE ? "not mounted" : "mounted");
@@ -359,7 +413,7 @@ bool mountStorage() {
 void printBootInfo() {
   Serial.println();
   Serial.println("======================================");
-  Serial.println("          ESP-BEDROCK 0.1.0");
+  Serial.println("          ESP-BEDROCK 0.2.0");
   Serial.println("======================================");
   Serial.println("Target: ESP32-WROVER-E");
   Serial.printf("Chip cores: %d\n", ESP.getChipCores());
@@ -380,32 +434,26 @@ void setup() {
   const bool sdReady = mountStorage();
 
   if (sdReady) {
-    if (!world.begin(SD))
+    if (!world.begin(SD)) {
       Serial.println("[WORLD] World initialization failed.");
+    }
   } else {
     Serial.println("[WORLD] Running without persistent SD storage.");
   }
 
-  terminal.begin(world);
+  wifiManager.begin();
 
-  WiFi.mode(WIFI_AP);
-  if (WiFi.softAP("ESP-Bedrock", "")) {
-    Serial.println("[NET] Wi-Fi AP: ESP-Bedrock");
-    Serial.print("[NET] AP address: ");
-    Serial.println(WiFi.softAPIP());
-  } else {
-    Serial.println("[NET] Failed to start SoftAP.");
+  terminal.begin(world, network);
+
+  // The server only binds its UDP socket after a normal Wi-Fi connection.
+  if (WiFi.status() == WL_CONNECTED) {
+    network.begin();
   }
-
-  if (network.begin())
-    Serial.printf("[NET] UDP listener active on %u\n", ESPBEDROCK_UDP_PORT);
-  else
-    Serial.println("[NET] UDP listener failed.");
 
   Serial.println();
   Serial.println("[READY] ESP-Bedrock prototype running.");
-  Serial.println("[READY] Connect the serial monitor at 115200 baud.");
-  Serial.println("[READY] No SoftAP is created.");
+  Serial.println("[READY] Serial monitor: 115200 baud.");
+  Serial.println("[READY] Wi-Fi: normal STA/client mode. No SoftAP.");
 }
 
 void loop() {
