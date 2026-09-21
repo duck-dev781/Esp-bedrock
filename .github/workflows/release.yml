@@ -31,10 +31,13 @@ jobs:
       - name: Compile official ESP32-WROVER firmware
         run: |
           set -euo pipefail
-          mkdir -p build
-          # Arduino CLI requires the sketch's main .ino name to match the directory.
-          cp ESP_Bedrock.ino Esp-bedrock.ino
-          arduino-cli compile             --fqbn esp32:esp32:esp32wrover             --output-dir build             .
+          rm -rf .ci
+          mkdir -p .ci/ESP_Bedrock build
+          cp ESP_Bedrock.ino .ci/ESP_Bedrock/ESP_Bedrock.ino
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32wrover \
+            --output-dir build \
+            .ci/ESP_Bedrock
           cp build/*.bin release/
 
       - name: Prepare release assets
