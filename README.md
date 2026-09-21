@@ -27,11 +27,12 @@ The SD card is used for persistent data so the RAM footprint stays small.
 ## Repository layout
 
 ```
-assets/       Runtime data and optional original assets
-config/       Server configuration
-include/      Public headers
-src/          Firmware/server implementation
-world/        Example world data format
+ESP_Bedrock.ino  Main Arduino sketch
+assets/          Runtime data and optional original assets
+config/          Server configuration
+include/         Modular development headers
+src/             Modular development implementation
+world/           Example world data format
 ```
 
 ## First prototype
@@ -41,10 +42,11 @@ The first build provides:
 - SD-card detection and directory creation.
 - World metadata load/save.
 - A compact procedural voxel world.
-- Player state.
+- Player state foundation.
 - Serial terminal commands.
-- UDP listener.
+- UDP listener on port 19132.
 - Runtime statistics.
+- Initial protocol VarUInt utilities.
 
 The Bedrock/RakNet implementation is intentionally separated from the world engine so protocol work can be expanded without rewriting the storage layer.
 
@@ -72,10 +74,12 @@ Only original code and original/simple placeholder data belong in this repositor
 
 ## Build
 
-This project uses PlatformIO with the Arduino framework.
+The easiest starting point is the single-file Arduino sketch:
 
-```
-pio run
-pio run -t upload
-pio device monitor -b 115200
-```
+`ESP_Bedrock.ino`
+
+Open it in Arduino IDE, select an ESP32-WROVER-E-compatible board, enable PSRAM when the board definition exposes that option, and upload it.
+
+Serial monitor: **115200 baud**.
+
+The repository also keeps the modular `src/` and `include/` implementation as a development layout for future expansion.
