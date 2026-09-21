@@ -1452,6 +1452,131 @@ private:
     networkSettingsRequestsCount++;
   }
 
+  bool sendStartGame(Peer &peer) {
+    if (!world || peer.startGameSent) return false;
+
+    uint8_t packet[1800] = {};
+    size_t offset = 0;
+
+    auto putVarUInt = [&](uint32_t v) -> bool {
+      uint8_t tmp[5];
+      const size_t n = BedrockProtocol::writeVarUInt(v, tmp, sizeof(tmp));
+      if (n == 0 || offset + n > sizeof(packet)) return false;
+      memcpy(packet + offset, tmp, n);
+      offset += n;
+      return true;
+    };
+    auto putVarInt = [&](int32_t v) -> bool { return putVarUInt((uint32_t)v); };
+    auto putVarLong = [&](int64_t v) -> bool {
+      uint8_t tmp[10];
+      const size_t n = BedrockProtocol::writeVarUInt64((uint64_t)v, tmp, sizeof(tmp));
+      if (n == 0 || offset + n > sizeof(packet)) return false;
+      memcpy(packet + offset, tmp, n);
+      offset += n;
+      return true;
+    };
+    auto putU64LE = [&](uint64_t v) -> bool {
+      if (offset + 8 > sizeof(packet)) return false;
+      for (uint8_t i = 0; i < 8; ++i) packet[offset++] = (uint8_t)(v >> (8U * i));
+      return true;
+    };
+    auto putU16LE = [&](uint16_t v) -> bool {
+      if (offset + 2 > sizeof(packet)) return false;
+      writeU16LE(packet + offset, v);
+      offset += 2;
+      return true;
+    };
+    auto putI32LE = [&](int32_t v) -> bool {
+      if (offset + 4 > sizeof(packet)) return false;
+      writeU32LE(packet + offset, (uint32_t)v);
+      offset += 4;
+      return true;
+    };
+    auto putBool = [&](bool v) -> bool {
+      if (offset + 1 > sizeof(packet)) return false;
+      packet[offset++] = v ? 1 : 0;
+      return true;
+    };
+    auto putFloatLE = [&](float v) -> bool {
+      if (offset + 4 > sizeof(packet)) return false;
+      memcpy(packet + offset, &v, sizeof(v));
+      offset += sizeof(v);
+      return true;
+    };
+    auto putString = [&](const String &s) -> bool {
+      size_t written = 0;
+      if (!BedrockProtocol::writeString(
+            s, packet + offset, sizeof(packet) - offset, written)) return false;
+      offset += written;
+      return true;
+    };
+
+    const int spawnX = 8;
+    const int spawnZ = 8;
+    const int spawnY = world->terrainHeight(spawnX, spawnZ) + 1;
+
+    if (!putVarUInt(BEDROCK_START_GAME_ID) ||
+        !putVarLong(1) || !putVarLong(1) || !putVarInt(0) ||
+        !putFloatLE(spawnX + 0.5f) ||
+        !putFloatLE(spawnY + 0.62f) ||
+        !putFloatLE(spawnZ + 0.5f) ||
+        !putFloatLE(0.0f) || !putFloatLE(0.0f)) return false;
+
+    // LevelSettings through protocol 2193.
+    if (!putU64LE(world->seed()) || !putU16LE(0) ||
+        !putString("") || !putVarInt(0) || !putVarInt(1) ||
+        !putVarInt(0) || !putBool(false) || !putVarInt(1) ||
+        !putVarInt(spawnX) || !putVarInt(spawnY) || !putVarInt(spawnZ) ||
+        !putBool(true) || !putVarInt(0) || !putBool(false) || !putBool(false) ||
+        !putVarInt(-1) || !putVarInt(0) || !putBool(false) || !putString("") ||
+        !putFloatLE(0.0f) || !putFloatLE(0.0f) || !putBool(false) ||
+        !putBool(true) || !putBool(true) || !putVarInt(0) || !putVarInt(0) ||
+        !putBool(true) || !putBool(false) || !putVarUInt(0) || !putVarUInt(0) ||
+        !putBool(false) || !putBool(false) || !putVarInt(1) || !putI32LE(4) ||
+        !putBool(false) || !putBool(false) || !putBool(false) || !putBool(false) ||
+        !putBool(false) || !putBool(false) || !putBool(false) || !putBool(false) ||
+        !putBool(false) || !putString(BEDROCK_VERSION_NAME) ||
+        !putI32LE(0) || !putI32LE(0) || !putBool(false) ||
+        !putString("") || !putString("") || !putBool(false) ||
+        !putVarInt(0) || !putBool(false) || !putVarInt(0) || !putBool(false)) return false;
+
+    // Level ID/name/template/trial.
+    if (!putString("espbedrock-world") ||
+        !putString(BEDROCK_LEVEL_NAME) ||
+        !putString("") || !putBool(false)) return false;
+
+    // Synced player movement settings, current tick, enchantment seed.
+    if (!putVarInt(0) || !putVarInt(0) || !putBool(false) ||
+        !putU64LE(world->gameTime()) || !putVarInt(0)) return false;
+
+    // Empty block properties; item definitions are a no-op in current codec.
+    if (!putVarUInt(0) || !putString("") || !putBool(false) ||
+        !putString("ESP-Bedrock")) return false;
+
+    // Empty player-property NBT: TAG_Compound + empty name + TAG_End.
+    if (offset + 4 > sizeof(packet)) return false;
+    packet[offset++] = 0x0A;
+    packet[offset++] = 0x00;
+    packet[offset++] = 0x00;
+    packet[offset++] = 0x00;
+
+    // Block registry checksum, world-template UUID, client-side generation,
+    // hashed block IDs, network permissions, logging chat.
+    if (!putU64LE(0) || !putU64LE(0) ||
+        !putBool(false) || !putBool(false) ||
+        !putBool(false) || !putBool(false)) return false;
+
+    // Server configuration join info is absent, followed by four empty IDs.
+    if (!putBool(false) || !putString("") || !putString("") ||
+        !putString("") || !putString("")) return false;
+
+    if (!sendEncryptedBedrockPacket(peer, packet, offset)) return false;
+
+    peer.startGameSent = true;
+    startGamePacketsSentCount++;
+    return true;
+  }
+
   void handleBedrockPayload(Peer &peer,
                             const uint8_t *data,
                             size_t length) {
@@ -1726,7 +1851,12 @@ private:
     writeU32LE(packet + out, (uint32_t)centerY); out += 4;
     writeU32LE(packet + out, (uint32_t)centerZ); out += 4;
 
-    packet[out++] = (uint8_t)requestCount;
+    uint8_t countBytes[5];
+    const countLength =
+      BedrockProtocol::writeVarUInt(requestCount, countBytes, sizeof(countBytes));
+    if (countLength == 0 || out + countLength > sizeof(packet)) return;
+    memcpy(packet + out, countBytes, countLength);
+    out += countLength;
 
     for (uint32_t i = 0; i < requestCount; ++i) {
       const uint8_t *requestOffset = data + offsetsStart + i * 3;
