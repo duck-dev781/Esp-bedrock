@@ -79,8 +79,11 @@ The first build provides:
 - A compact procedural voxel world.
 - Player state foundation.
 - Serial terminal commands.
-- UDP listener on port 19132.
-- Runtime statistics.
+- RakNet offline ping/pong server discovery.
+- RakNet OpenConnectionRequest1/OpenConnectionReply1.
+- RakNet OpenConnectionRequest2/OpenConnectionReply2.
+- Basic RakNet connected-frame parsing and connected ping/pong.
+- Runtime RakNet peer tracking and statistics.
 - Initial protocol VarUInt utilities.
 
 The Bedrock/RakNet implementation is intentionally separated from the world engine so protocol work can be expanded without rewriting the storage layer.
@@ -126,3 +129,16 @@ For the Freenove documentation's Arduino setup, select **ESP32 Wrover Module** a
 Serial monitor: **115200 baud**.
 
 The repository also keeps the modular `src/` and `include/` implementation as a development layout for future expansion.
+
+## Network transport status
+
+The sketch now has the classic RakNet direct-server path on UDP 19132 through the offline discovery and OpenConnection stages.
+
+A modern Bedrock release can also use NetherNet/WebRTC for LAN games. That transport is separate from RakNet and is being added as its own layer; it should not be confused with the direct RakNet server path.
+
+The current RakNet layer is therefore a real protocol foundation, not yet a complete playable Bedrock implementation. The next layers are:
+
+1. RakNet reliable ordered frames, ACK/NACK handling, and connection acceptance.
+2. Bedrock batch/compression and login packets.
+3. Player/chunk/inventory/survival packets.
+4. NetherNet LAN discovery and WebRTC transport where required by the client version.
