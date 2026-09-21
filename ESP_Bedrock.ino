@@ -24,7 +24,8 @@
 
   Next protocol/gameplay layers:
     - RakNet session handshake
-    - Bedrock login/session packets
+    - RakNet split-frame reassembly
+    - Bedrock login/session packet parsing
     - chunk serialization
     - player movement
     - block break/place
@@ -55,7 +56,7 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 
-#define ESPBEDROCK_VERSION       "0.5.0"
+#define ESPBEDROCK_VERSION       "0.5.1"
 #define ESPBEDROCK_UDP_PORT      19132
 #define ESPBEDROCK_HOSTNAME       "esp-bedrock"
 #define ESPBEDROCK_MAX_PLAYERS   4
@@ -63,6 +64,9 @@
 #define RAKNET_MAX_MTU           1492
 #define RAKNET_SYSTEM_ADDRESS_COUNT 20
 #define RAKNET_RELIABLE_CACHE      4
+#define RAKNET_SPLIT_SLOT           1480
+#define RAKNET_MAX_SPLITS           128
+#define RAKNET_MAX_SPLIT_MEMORY      (192 * 1024)
 #define BEDROCK_PROTOCOL_VERSION 2193
 #define BEDROCK_VERSION_NAME     "1.26.51"
 #define BEDROCK_LEVEL_NAME       "ESP World"
@@ -429,13 +433,29 @@ public:
     uint8_t data[1200] = {};
   };
 
+  struct SplitAssembly {
+    bool active = false;
+    uint16_t splitId = 0;
+    uint32_t splitCount = 0;
+    uint32_t receivedCount = 0;
+    size_t totalBytes = 0;
+    uint32_t lastUpdate = 0;
+    uint8_t *buffer = nullptr;
+    uint8_t received[RakNetMaxSplits()] = {};
+  };
+
   struct Peer {
     bool active = false;
     bool openConnection = false;
     bool established = false;
     bool networkSettingsSent = false;
+    bool loginReceived = false;
 
     uint64_t clientGuid = 0;
+    uint32_t clientProtocol = 0;
+    uint32_t loginChainBytes = 0;
+    uint32_t loginSkinBytes = 0;
+
     IPAddress ip;
     uint16_t port = 0;
     uint16_t mtu = 1200;
@@ -450,11 +470,16 @@ public:
     uint32_t expectedDatagramSequence = 0;
     bool haveExpectedDatagramSequence = false;
 
+    SplitAssembly split;
     ReliableCache reliable[RakNetCacheCount()];
   };
 
   static constexpr uint8_t RakNetCacheCount() {
     return RAKNET_RELIABLE_CACHE;
+  }
+
+  static constexpr uint16_t RakNetMaxSplits() {
+    return RAKNET_MAX_SPLITS;
   }
 
   bool begin() {
@@ -550,6 +575,8 @@ public:
   uint32_t nackPackets() const { return nackPacketsCount; }
   uint32_t reliableSent() const { return reliableSentCount; }
   uint32_t networkSettingsRequests() const { return networkSettingsRequestsCount; }
+  uint32_t loginPackets() const { return loginPacketsCount; }
+  uint32_t loginVersionMatches() const { return loginVersionMatchesCount; }
 
   uint8_t activePeers() const {
     uint8_t count = 0;
@@ -576,6 +603,8 @@ private:
   uint32_t nackPacketsCount = 0;
   uint32_t reliableSentCount = 0;
   uint32_t networkSettingsRequestsCount = 0;
+  uint32_t loginPacketsCount = 0;
+  uint32_t loginVersionMatchesCount = 0;
 
   Peer peers[ESPBEDROCK_MAX_PLAYERS];
 
@@ -588,6 +617,10 @@ private:
     return ((uint16_t)in[0] << 8) | in[1];
   }
 
+  static uint16_t readU16LE(const uint8_t *in) {
+    return ((uint16_t)in[0]) | ((uint16_t)in[1] << 8);
+  }
+
   static void writeU16LE(uint8_t *out, uint16_t value) {
     out[0] = (uint8_t)value;
     out[1] = (uint8_t)(value >> 8);
@@ -598,6 +631,13 @@ private:
     out[1] = (uint8_t)(value >> 8);
     out[2] = (uint8_t)(value >> 16);
     out[3] = (uint8_t)(value >> 24);
+  }
+
+  static uint32_t readU32LE(const uint8_t *in) {
+    return ((uint32_t)in[0]) |
+           ((uint32_t)in[1] << 8) |
+           ((uint32_t)in[2] << 16) |
+           ((uint32_t)in[3] << 24);
   }
 
   static uint32_t readU32BE(const uint8_t *in) {
@@ -669,6 +709,18 @@ private:
     return nullptr;
   }
 
+  static void clearSplitAssembly(SplitAssembly &split) {
+    if (split.buffer) {
+      free(split.buffer);
+    }
+    split = SplitAssembly{};
+  }
+
+  void resetPeer(Peer &peer) {
+    clearSplitAssembly(peer.split);
+    peer = Peer{};
+  }
+
   Peer *allocatePeer(const IPAddress &ip, uint16_t port, uint64_t guid) {
     Peer *peer = findPeer(ip, port, guid);
 
@@ -699,7 +751,12 @@ private:
       if (!peer.active) continue;
 
       if (now - peer.lastSeen > 120000UL) {
-        peer = Peer{};
+        resetPeer(peer);
+      }
+
+      if (peer.split.active &&
+          now - peer.split.lastUpdate > 10000UL) {
+        clearSplitAssembly(peer.split);
       }
     }
   }
@@ -954,13 +1011,13 @@ private:
         readU32BE(data + offset);
 
       Serial.printf(
-        "[BEDROCK] RequestNetworkSettings version=%lu\\n",
+        "[BEDROCK] RequestNetworkSettings version=%lu\n",
         (unsigned long)clientProtocol
       );
 
       if (clientProtocol != BEDROCK_PROTOCOL_VERSION) {
         Serial.printf(
-          "[BEDROCK] Client version differs. expected=%u\\n",
+          "[BEDROCK] Client version differs. expected=%u\n",
           BEDROCK_PROTOCOL_VERSION
         );
       }
@@ -976,15 +1033,99 @@ private:
     }
 
     if (packetId == 1) {
-      // Login packet. We intentionally do not accept/forge authentication
-      // here yet; the next stage will parse the JWT chain and establish the
-      // encrypted session using the ESP32's mbedTLS support.
-      Serial.printf(
-        "[BEDROCK] Login packet received (%u bytes). Authentication stage next.\\n",
-        (unsigned)length
-      );
+      handleLoginPacket(peer, data + offset, length - offset);
       return;
     }
+  }
+
+  bool readBedrockStringSpan(const uint8_t *data,
+                             size_t length,
+                             size_t &offset,
+                             size_t &stringOffset,
+                             uint32_t &stringLength) {
+    uint32_t lengthValue = 0;
+
+    if (!BedrockProtocol::readVarUInt(
+          data, length, offset, lengthValue)) {
+      return false;
+    }
+
+    if ((size_t)lengthValue > length - offset) {
+      return false;
+    }
+
+    stringOffset = offset;
+    stringLength = lengthValue;
+    offset += lengthValue;
+    return true;
+  }
+
+  void handleLoginPacket(Peer &peer,
+                         const uint8_t *data,
+                         size_t length) {
+    loginPacketsCount++;
+
+    // LoginPacket:
+    //   Protocol Version: big-endian int32
+    //   Chain Data: length-prefixed string
+    //   Skin Data: length-prefixed string
+    if (length < 4) {
+      Serial.println("[BEDROCK] Login packet too short.");
+      return;
+    }
+
+    const uint32_t clientProtocol = readU32BE(data);
+    size_t offset = 4;
+
+    size_t chainOffset = 0;
+    uint32_t chainLength = 0;
+
+    if (!readBedrockStringSpan(
+          data, length, offset, chainOffset, chainLength)) {
+      Serial.println("[BEDROCK] Login chain data is malformed.");
+      return;
+    }
+
+    size_t skinOffset = 0;
+    uint32_t skinLength = 0;
+
+    if (!readBedrockStringSpan(
+          data, length, offset, skinOffset, skinLength)) {
+      Serial.println("[BEDROCK] Login skin data is malformed.");
+      return;
+    }
+
+    if (offset != length) {
+      Serial.printf(
+        "[BEDROCK] Login has %u trailing bytes.\n",
+        (unsigned)(length - offset)
+      );
+    }
+
+    peer.loginReceived = true;
+    peer.clientProtocol = clientProtocol;
+    peer.loginChainBytes = chainLength;
+    peer.loginSkinBytes = skinLength;
+
+    if (clientProtocol == BEDROCK_PROTOCOL_VERSION) {
+      loginVersionMatchesCount++;
+    }
+
+    Serial.printf(
+      "[BEDROCK] Login protocol=%lu chain=%lu bytes skin=%lu bytes%s\n",
+      (unsigned long)clientProtocol,
+      (unsigned long)chainLength,
+      (unsigned long)skinLength,
+      clientProtocol == BEDROCK_PROTOCOL_VERSION
+        ? " (version match)"
+        : " (version differs)"
+    );
+
+    // Authentication/encryption is intentionally not forged here. The next
+    // stage will validate the JWT chain, establish the Bedrock crypto session,
+    // and only then send PlayStatus/StartGame.
+    (void)chainOffset;
+    (void)skinOffset;
   }
 
   void handleGameBatch(Peer &peer,
@@ -1003,7 +1144,7 @@ private:
 
       if (compressionMethod != BEDROCK_BATCH_NONE) {
         Serial.printf(
-          "[BEDROCK] Unsupported compression method 0x%02X; dropping batch.\\n",
+          "[BEDROCK] Unsupported compression method 0x%02X; dropping batch.\n",
           compressionMethod
         );
         return;
@@ -1043,7 +1184,7 @@ private:
     Peer *peer = findPeer(ip, port);
 
     if (!peer) {
-      Serial.printf("[RAKNET] Datagram from unknown peer %s:%u\\n",
+      Serial.printf("[RAKNET] Datagram from unknown peer %s:%u\n",
                     ip.toString().c_str(), (unsigned)port);
       return;
     }
@@ -1056,6 +1197,141 @@ private:
     sendAck(ip, port, sequence);
 
     parseFrames(data + 4, length - 4, *peer);
+  }
+
+  void handleFramePayload(Peer &peer,
+                          const uint8_t *payload,
+                          size_t payloadBytes) {
+    if (payloadBytes == 0) return;
+
+    if (payload[0] == 0x09 &&
+        payloadBytes >= 18) {
+      peer.clientGuid = readU64BE(payload + 1);
+
+      const uint64_t pingTime = readU64BE(payload + 9);
+      const bool secure = payload[17] != 0;
+      (void)secure;
+
+      peer.openConnection = true;
+      sendConnectionRequestAccepted(peer, pingTime);
+
+      handshakeCount++;
+
+      Serial.printf(
+        "[RAKNET] ConnectionRequest guid=%s\n",
+        u64ToDecimal(peer.clientGuid).c_str()
+      );
+      return;
+    }
+
+    if (payload[0] == 0x13) {
+      peer.established = true;
+
+      Serial.println(
+        "[RAKNET] NewIncomingConnection received. "
+        "RakNet session established."
+      );
+      return;
+    }
+
+    if (payload[0] == 0x00 &&
+        payloadBytes >= 17) {
+      const uint64_t pingTime = readU64BE(payload + 1);
+      sendConnectedPong(peer, pingTime);
+      return;
+    }
+
+    if (payload[0] == BEDROCK_GAME_PACKET_ID) {
+      handleGameBatch(peer, payload, payloadBytes);
+      return;
+    }
+
+    handleBedrockPayload(peer, payload, payloadBytes);
+  }
+
+  bool handleSplitFrame(Peer &peer,
+                        const uint8_t *payload,
+                        size_t payloadBytes,
+                        uint32_t splitCount,
+                        uint16_t splitId,
+                        uint32_t splitIndex) {
+    if (splitCount == 0 ||
+        splitCount > RAKNET_MAX_SPLITS ||
+        splitIndex >= splitCount) {
+      return false;
+    }
+
+    const size_t requiredBytes =
+      (size_t)splitCount * RAKNET_SPLIT_SLOT;
+
+    if (requiredBytes > RAKNET_MAX_SPLIT_MEMORY) {
+      Serial.printf(
+        "[RAKNET] Split packet too large: %lu bytes\n",
+        (unsigned long)requiredBytes
+      );
+      return false;
+    }
+
+    SplitAssembly &split = peer.split;
+
+    if (!split.active ||
+        split.splitId != splitId ||
+        split.splitCount != splitCount) {
+      clearSplitAssembly(split);
+
+      split.buffer = (uint8_t *)ps_malloc(requiredBytes);
+
+      if (!split.buffer) {
+        split.buffer = (uint8_t *)malloc(requiredBytes);
+      }
+
+      if (!split.buffer) {
+        Serial.printf(
+          "[RAKNET] Split allocation failed: %lu bytes\n",
+          (unsigned long)requiredBytes
+        );
+        return false;
+      }
+
+      memset(split.buffer, 0, requiredBytes);
+      split.active = true;
+      split.splitId = splitId;
+      split.splitCount = splitCount;
+      split.receivedCount = 0;
+      split.totalBytes = 0;
+    }
+
+    const size_t writeOffset =
+      (size_t)splitIndex * RAKNET_SPLIT_SLOT;
+
+    if (writeOffset + payloadBytes > requiredBytes) {
+      return false;
+    }
+
+    if (split.received[splitIndex] == 0) {
+      memcpy(split.buffer + writeOffset, payload, payloadBytes);
+      split.received[splitIndex] = 1;
+      split.receivedCount++;
+
+      const size_t endOffset = writeOffset + payloadBytes;
+
+      if (endOffset > split.totalBytes) {
+        split.totalBytes = endOffset;
+      }
+    }
+
+    split.lastUpdate = millis();
+
+    if (split.receivedCount != split.splitCount) {
+      return true;
+    }
+
+    const size_t totalBytes = split.totalBytes;
+
+    handleFramePayload(peer, split.buffer, totalBytes);
+
+    clearSplitAssembly(split);
+    return true;
   }
 
   void parseFrames(const uint8_t *data,
@@ -1072,28 +1348,48 @@ private:
         ((uint16_t)data[offset] << 8) | data[offset + 1];
       offset += 2;
 
+      // RakNet reliability modes commonly used by Bedrock:
+      //   0 = unreliable
+      //   1 = unreliable sequenced
+      //   2 = reliable
+      //   3 = reliable ordered
+      //   4 = reliable sequenced
+      // Modes 5-7 carry additional receipt metadata and are not needed
+      // for the current Bedrock login/session path.
       if (reliability == 2 || reliability == 3 ||
           reliability == 4 || reliability == 6 ||
           reliability == 7) {
         if (offset + 3 > length) return;
-        offset += 3;
+        offset += 3; // reliable message index
       }
 
       if (reliability == 1 || reliability == 4) {
         if (offset + 3 > length) return;
-        offset += 3;
+        offset += 3; // sequence index
       }
 
       if (reliability == 1 || reliability == 3 ||
           reliability == 4 || reliability == 7) {
         if (offset + 4 > length) return;
-        offset += 3;
-        offset += 1;
+        offset += 3; // order index
+        offset += 1; // channel
       }
+
+      uint32_t splitCount = 0;
+      uint16_t splitId = 0;
+      uint32_t splitIndex = 0;
 
       if (isSplit) {
         if (offset + 10 > length) return;
-        offset += 10;
+
+        splitCount = readU32LE(data + offset);
+        offset += 4;
+
+        splitId = readU16LE(data + offset);
+        offset += 2;
+
+        splitIndex = readU32LE(data + offset);
+        offset += 4;
       }
 
       const size_t payloadBytes =
@@ -1106,49 +1402,17 @@ private:
 
       const uint8_t *payload = data + offset;
 
-      if (payload[0] == 0x09 &&
-          payloadBytes >= 17) {
-        peer.clientGuid =
-          readU64BE(payload + 1);
-
-        const uint64_t pingTime =
-          readU64BE(payload + 9);
-
-        const bool secure =
-          payload[17 - 1] != 0;
-
-        (void)secure;
-
-        peer.openConnection = true;
-        sendConnectionRequestAccepted(peer, pingTime);
-
-        handshakeCount++;
-
-        Serial.printf(
-          "[RAKNET] ConnectionRequest guid=%s\\n",
-          u64ToDecimal(peer.clientGuid).c_str()
+      if (isSplit) {
+        handleSplitFrame(
+          peer,
+          payload,
+          payloadBytes,
+          splitCount,
+          splitId,
+          splitIndex
         );
-      }
-      else if (payload[0] == 0x13) {
-        peer.established = true;
-
-        Serial.println(
-          "[RAKNET] NewIncomingConnection received. "
-          "RakNet session established."
-        );
-      }
-      else if (payload[0] == 0x00 &&
-               payloadBytes >= 9) {
-        const uint64_t pingTime =
-          readU64BE(payload + 1);
-
-        sendConnectedPong(peer, pingTime);
-      }
-      else if (payload[0] == BEDROCK_GAME_PACKET_ID) {
-        handleGameBatch(peer, payload, payloadBytes);
-      }
-      else {
-        handleBedrockPayload(peer, payload, payloadBytes);
+      } else {
+        handleFramePayload(peer, payload, payloadBytes);
       }
 
       offset += payloadBytes;
@@ -1211,7 +1475,11 @@ private:
     if (command == "help") printHelp();
     else if (command == "status") cmdStatus();
     else if (command == "players")
-      Serial.println("Players: 0 (RakNet/Bedrock session layer not attached yet)");
+      Serial.printf(
+        "Active peers: %u/%u\n",
+        (unsigned)network->activePeers(),
+        (unsigned)ESPBEDROCK_MAX_PLAYERS
+      );
     else if (command == "world") cmdWorld();
     else if (command == "save") world->save();
     else if (command == "regen") world->regenerate();
@@ -1485,7 +1753,7 @@ bool mountStorage() {
 void printBootInfo() {
   Serial.println();
   Serial.println("======================================");
-  Serial.println("          ESP-BEDROCK 0.5.0");
+  Serial.println("          ESP-BEDROCK 0.5.1");
   Serial.println("======================================");
   Serial.println("Target: ESP32-WROVER-E");
   Serial.printf("Chip cores: %d\n", ESP.getChipCores());
