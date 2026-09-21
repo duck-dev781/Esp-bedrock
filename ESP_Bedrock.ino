@@ -64,8 +64,8 @@
 #include <mbedtls/ecdsa.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
-#include <mbedtls/sha512.h>
 #include <esp_system.h>
 
 #define ESPBEDROCK_VERSION       "0.6.0"
@@ -1559,71 +1559,50 @@ private:
     mbedtls_pk_init(&clientKey);
 
     const int parseRc = mbedtls_pk_parse_public_key(
-      &clientKey,
-      clientDer,
-      clientDerLength
+      &clientKey, clientDer, clientDerLength
     );
 
     if (parseRc != 0 ||
-        !mbedtls_pk_can_do(&clientKey, MBEDTLS_PK_ECKEY)) {
+        mbedtls_pk_get_type(&clientKey) != MBEDTLS_PK_ECKEY) {
       Serial.printf("[CRYPTO] Client public-key parse failed: %d\n", parseRc);
       mbedtls_pk_free(&clientKey);
       return false;
     }
 
-    mbedtls_ecp_keypair *serverEc = mbedtls_pk_ec(serverKey);
-    mbedtls_ecp_keypair *clientEc = mbedtls_pk_ec(clientKey);
+    uint8_t sharedSecret[64] = {};
+    size_t sharedLength = 0;
 
-    if (serverEc->grp.id != MBEDTLS_ECP_DP_SECP384R1 ||
-        clientEc->grp.id != MBEDTLS_ECP_DP_SECP384R1 ||
-        mbedtls_ecp_check_pubkey(&serverEc->grp, &clientEc->Q) != 0) {
-      Serial.println("[CRYPTO] Client key is not a valid P-384 public key.");
-      mbedtls_pk_free(&clientKey);
-      return false;
-    }
-
-    mbedtls_mpi shared;
-    mbedtls_mpi_init(&shared);
-
-    const int sharedRc = mbedtls_ecp_compute_shared(
-      &serverEc->grp,
-      &shared,
-      &clientEc->Q,
-      &serverEc->d,
-      mbedtls_ctr_drbg_random,
-      &drbg
-    );
-
-    if (sharedRc != 0) {
-      Serial.printf("[CRYPTO] ECDH failed: %d\n", sharedRc);
-      mbedtls_mpi_free(&shared);
-      mbedtls_pk_free(&clientKey);
-      return false;
-    }
-
-    uint8_t sharedSecret[48] = {};
-    const int secretRc = mbedtls_mpi_write_binary(
-      &shared,
+    const int deriveRc = mbedtls_pk_derive(
+      &serverKey,
+      &clientKey,
       sharedSecret,
-      sizeof(sharedSecret)
+      sizeof(sharedSecret),
+      &sharedLength
     );
-    mbedtls_mpi_free(&shared);
 
-    if (secretRc != 0) {
-      Serial.printf("[CRYPTO] Shared-secret export failed: %d\n", secretRc);
+    if (deriveRc != 0 || sharedLength == 0 || sharedLength > sizeof(sharedSecret)) {
+      Serial.printf("[CRYPTO] ECDH derive failed: %d\n", deriveRc);
       mbedtls_pk_free(&clientKey);
       return false;
     }
 
-    uint8_t keyInput[64] = {};
+    uint8_t keyInput[16 + sizeof(sharedSecret)] = {};
     memcpy(keyInput, peer.encryptionSalt, 16);
-    memcpy(keyInput + 16, sharedSecret, sizeof(sharedSecret));
+    memcpy(keyInput + 16, sharedSecret, sharedLength);
 
-    const int hashRc = mbedtls_sha256_ret(
+    const mbedtls_md_info_t *sha256Info =
+      mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (sha256Info == nullptr) {
+      mbedtls_pk_free(&clientKey);
+      memset(sharedSecret, 0, sizeof(sharedSecret));
+      return false;
+    }
+
+    const int hashRc = mbedtls_md(
+      sha256Info,
       keyInput,
-      sizeof(keyInput),
-      peer.sessionKey,
-      0
+      16 + sharedLength,
+      peer.sessionKey
     );
 
     memset(sharedSecret, 0, sizeof(sharedSecret));
@@ -1667,44 +1646,87 @@ private:
 
   bool signHandshakeInput(const String &signingInput,
                           uint8_t rawSignature[96]) {
-    uint8_t hash[64] = {};
-    if (mbedtls_sha512_ret(
+    uint8_t hash[48] = {};
+    const mbedtls_md_info_t *sha384Info =
+      mbedtls_md_info_from_type(MBEDTLS_MD_SHA384);
+    if (sha384Info == nullptr) return false;
+
+    if (mbedtls_md(
+          sha384Info,
           (const unsigned char *)signingInput.c_str(),
           signingInput.length(),
-          hash,
-          0) != 0) {
+          hash
+        ) != 0) {
       return false;
     }
 
-    mbedtls_ecp_keypair *serverEc = mbedtls_pk_ec(serverKey);
-    mbedtls_mpi r;
-    mbedtls_mpi s;
-    mbedtls_mpi_init(&r);
-    mbedtls_mpi_init(&s);
-
-    const int signRc = mbedtls_ecdsa_sign(
-      &serverEc->grp,
-      &r,
-      &s,
-      &serverEc->d,
+    uint8_t derSignature[160] = {};
+    size_t derLength = 0;
+    const int signRc = mbedtls_pk_sign(
+      &serverKey,
+      MBEDTLS_MD_SHA384,
       hash,
-      48,
-      mbedtls_ctr_drbg_random,
-      &drbg
+      sizeof(hash),
+      derSignature,
+      sizeof(derSignature),
+      &derLength
     );
 
-    if (signRc != 0) {
-      mbedtls_mpi_free(&r);
-      mbedtls_mpi_free(&s);
+    if (signRc != 0 || derLength < 8) {
+      Serial.printf("[CRYPTO] ES384 signing failed: %d\n", signRc);
       return false;
     }
 
-    const int rRc = mbedtls_mpi_write_binary(&r, rawSignature, 48);
-    const int sRc = mbedtls_mpi_write_binary(&s, rawSignature + 48, 48);
-    mbedtls_mpi_free(&r);
-    mbedtls_mpi_free(&s);
+    size_t p = 0;
+    if (derSignature[p++] != 0x30 || p >= derLength) return false;
 
-    return rRc == 0 && sRc == 0;
+    size_t sequenceLength = 0;
+    uint8_t seqLenByte = derSignature[p++];
+    if ((seqLenByte & 0x80U) != 0) {
+      const uint8_t count = seqLenByte & 0x7FU;
+      if (count == 0 || count > 2 || p + count > derLength) return false;
+      for (uint8_t i = 0; i < count; ++i) {
+        sequenceLength = (sequenceLength << 8) | derSignature[p++];
+      }
+    } else {
+      sequenceLength = seqLenByte;
+    }
+
+    if (sequenceLength > derLength - p) return false;
+    const size_t sequenceEnd = p + sequenceLength;
+
+    auto readInteger = [&](uint8_t *out) -> bool {
+      if (p + 2 > sequenceEnd || derSignature[p++] != 0x02) return false;
+      size_t n = derSignature[p++];
+      if ((n & 0x80U) != 0) {
+        const uint8_t count = n & 0x7FU;
+        if (count == 0 || count > 2 || p + count > sequenceEnd) return false;
+        n = 0;
+        for (uint8_t i = 0; i < count; ++i) {
+          n = (n << 8) | derSignature[p++];
+        }
+      }
+      if (n == 0 || n > sequenceEnd - p) return false;
+
+      while (n > 1 && derSignature[p] == 0x00) {
+        ++p;
+        --n;
+      }
+      if (n > 48) return false;
+
+      memset(out, 0, 48);
+      memcpy(out + (48 - n), derSignature + p, n);
+      p += n;
+      return true;
+    };
+
+    memset(rawSignature, 0, 96);
+    if (!readInteger(rawSignature) ||
+        !readInteger(rawSignature + 48)) {
+      return false;
+    }
+
+    return p == sequenceEnd;
   }
 
   bool createHandshakeJwt(const uint8_t *token,
@@ -1806,11 +1828,11 @@ private:
     );
 
     uint8_t digest[32] = {};
-    const int rc = mbedtls_sha256_ret(
+    const int rc = mbedtls_md(
+      mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
       input,
       inputLength,
-      digest,
-      0
+      digest
     );
     free(input);
 
@@ -1843,11 +1865,11 @@ private:
     );
 
     uint8_t digest[32] = {};
-    const int rc = mbedtls_sha256_ret(
+    const int rc = mbedtls_md(
+      mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
       input,
       inputLength,
-      digest,
-      0
+      digest
     );
     free(input);
 
